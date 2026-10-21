@@ -110,14 +110,14 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     };
 
     let all_subservices_ready = uds_ready && ai_bridge && sshd_ready && storage_ready;
-    let status_str = if all_subservices_ready {
-        "healthy"
+    let (status_code, status_str) = if all_subservices_ready {
+        (StatusCode::OK, "healthy")
     } else {
-        "degraded"
+        (StatusCode::SERVICE_UNAVAILABLE, "degraded")
     };
 
     (
-        StatusCode::OK,
+        status_code,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         json!({
             "status": status_str,
@@ -131,7 +131,7 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
                 "sshd": sshd_ready,
                 "storage": storage_ready
             },
-            "ok": true
+            "ok": all_subservices_ready
         })
         .to_string(),
     )

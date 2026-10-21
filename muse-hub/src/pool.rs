@@ -425,135 +425,147 @@ impl WorkerPool {
                     w.last_checked = Instant::now();
 
                     match res {
-                        Ok(resp) if resp.status().is_success() => {
-                            let resp_body = resp.text().await.unwrap_or_default();
-                            let parsed: serde_json::Value =
-                                serde_json::from_str(&resp_body).unwrap_or_default();
-
-                            let subservices = if let Some(sub_val) = parsed.get("subservices") {
-                                serde_json::from_value::<SubservicesStatus>(sub_val.clone())
-                                    .unwrap_or(SubservicesStatus {
-                                        ai_bridge: true,
-                                        uds_socket: true,
-                                        sshd: true,
-                                        storage: true,
-                                    })
-                            } else {
-                                // Backward-compatible with older agents that do not expose subservices checklist
-                                SubservicesStatus {
-                                    ai_bridge: true,
-                                    uds_socket: true,
-                                    sshd: true,
-                                    storage: true,
-                                }
-                            };
-
-                            w.subservices = subservices.clone();
-                            w.consecutive_failures = 0;
-                            // If AI bridge & UDS are ready, node can serve AI inference requests
-                            w.is_healthy = subservices.ai_bridge && subservices.uds_socket;
-
-                            let all_ready = subservices.all_ready();
-
-                            match &w.lifecycle {
-                                LifecycleState::DownConfirmed { .. }
-                                | LifecycleState::DownPending { .. } => {
-                                    if all_ready {
-                                        // Immediately mark 100% UP without waiting for grace period
-                                        w.lifecycle = LifecycleState::Healthy;
-                                        alert_action = AlertAction::SendOnline(w.clone());
-                                    } else {
-                                        // Subservices still pending (e.g. UDS/SSH/Sync), start grace window timer
-                                        w.lifecycle = LifecycleState::Recovering {
-                                            first_seen_ok: Instant::now(),
-                                            last_details: subservices,
-                                        };
-                                        info!(
-                                            "Worker {} ({}) responding but subservices incomplete. Starting 5m grace window.",
-                                            w.name, target
-                                        );
-                                    }
-                                }
-                                LifecycleState::Recovering { first_seen_ok, .. } => {
-                                    let elapsed = first_seen_ok.elapsed().as_secs();
-                                    if all_ready {
-                                        // All subservices ready before grace window expired -> send UP immediately!
-                                        w.lifecycle = LifecycleState::Healthy;
-                                        alert_action = AlertAction::SendOnline(w.clone());
-                                    } else if elapsed >= MAX_GRACE_WINDOW_SECS {
-                                        // Grace window expired and subservices still failing -> send DEGRADED alert
-                                        w.lifecycle = LifecycleState::Degraded {
-                                            first_detected: *first_seen_ok,
-                                            last_details: subservices,
-                                            alert_sent: true,
-                                        };
-                                        alert_action =
-                                            AlertAction::SendDegraded(w.clone(), elapsed);
-                                    } else {
-                                        // Still within grace window, update last_details
-                                        w.lifecycle = LifecycleState::Recovering {
-                                            first_seen_ok: *first_seen_ok,
-                                            last_details: subservices,
-                                        };
-                                    }
-                                }
-                                LifecycleState::Degraded {
-                                    first_detected,
-                                    alert_sent,
-                                    ..
-                                } => {
-                                    if all_ready {
-                                        w.lifecycle = LifecycleState::Healthy;
-                                        alert_action = AlertAction::SendOnline(w.clone());
-                                    } else {
-                                        w.lifecycle = LifecycleState::Degraded {
-                                            first_detected: *first_detected,
-                                            last_details: subservices,
-                                            alert_sent: *alert_sent,
-                                        };
-                                    }
-                                }
-                                LifecycleState::Healthy => {
-                                    if !all_ready {
-                                        // Previously healthy, now one or more subservices are down
-                                        w.lifecycle = LifecycleState::Recovering {
-                                            first_seen_ok: Instant::now(),
-                                            last_details: subservices,
-                                        };
-                                    }
-                                }
-                            }
-                        }
                         Ok(resp) => {
-                            let status_code = resp.status().as_u16();
-                            w.consecutive_failures += 1;
-                            w.is_healthy = false;
+                            let status = resp.status();
+                            let resp_body = resp.text().await.unwrap_or_default();
+                            let parsed: Option<serde_json::Value> =
+                                serde_json::from_str(&resp_body).ok();
+                            let has_subservices =
+                                parsed.as_ref().and_then(|p| p.get("subservices")).is_some();
 
-                            match &w.lifecycle {
-                                LifecycleState::DownConfirmed { .. } => {
-                                    // Already confirmed down, avoid alert spam
-                                }
-                                LifecycleState::DownPending {
-                                    first_detected_down,
-                                    ..
-                                } => {
-                                    if w.consecutive_failures >= DOWN_CONFIRM_FAILURES {
-                                        w.lifecycle = LifecycleState::DownConfirmed {
-                                            since: *first_detected_down,
-                                            reason: format!("HTTP Status {}", status_code),
-                                        };
-                                        alert_action =
-                                            AlertAction::SendHttpDegraded(w.clone(), status_code);
-                                        if let Some(hook) = &w.on_offline_hook {
-                                            hook_to_trigger = Some((w.name.clone(), hook.clone()));
+                            if status.is_success()
+                                || (status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                                    && has_subservices)
+                            {
+                                let parsed_val = parsed.unwrap_or_default();
+                                let subservices =
+                                    if let Some(sub_val) = parsed_val.get("subservices") {
+                                        serde_json::from_value::<SubservicesStatus>(sub_val.clone())
+                                            .unwrap_or(SubservicesStatus {
+                                                ai_bridge: true,
+                                                uds_socket: true,
+                                                sshd: true,
+                                                storage: true,
+                                            })
+                                    } else {
+                                        // Backward-compatible with older agents that do not expose subservices checklist
+                                        SubservicesStatus {
+                                            ai_bridge: true,
+                                            uds_socket: true,
+                                            sshd: true,
+                                            storage: true,
+                                        }
+                                    };
+
+                                w.subservices = subservices.clone();
+                                w.consecutive_failures = 0;
+                                // If AI bridge & UDS are ready, node can serve AI inference requests
+                                w.is_healthy = subservices.ai_bridge && subservices.uds_socket;
+
+                                let all_ready = subservices.all_ready();
+
+                                match &w.lifecycle {
+                                    LifecycleState::DownConfirmed { .. }
+                                    | LifecycleState::DownPending { .. } => {
+                                        if all_ready {
+                                            // Immediately mark 100% UP without waiting for grace period
+                                            w.lifecycle = LifecycleState::Healthy;
+                                            alert_action = AlertAction::SendOnline(w.clone());
+                                        } else {
+                                            // Subservices still pending (e.g. UDS/SSH/Sync), start grace window timer
+                                            w.lifecycle = LifecycleState::Recovering {
+                                                first_seen_ok: Instant::now(),
+                                                last_details: subservices,
+                                            };
+                                            info!(
+                                                "Worker {} ({}) responding but subservices incomplete. Starting 5m grace window.",
+                                                w.name, target
+                                            );
+                                        }
+                                    }
+                                    LifecycleState::Recovering { first_seen_ok, .. } => {
+                                        let elapsed = first_seen_ok.elapsed().as_secs();
+                                        if all_ready {
+                                            // All subservices ready before grace window expired -> send UP immediately!
+                                            w.lifecycle = LifecycleState::Healthy;
+                                            alert_action = AlertAction::SendOnline(w.clone());
+                                        } else if elapsed >= MAX_GRACE_WINDOW_SECS {
+                                            // Grace window expired and subservices still failing -> send DEGRADED alert
+                                            w.lifecycle = LifecycleState::Degraded {
+                                                first_detected: *first_seen_ok,
+                                                last_details: subservices,
+                                                alert_sent: true,
+                                            };
+                                            alert_action =
+                                                AlertAction::SendDegraded(w.clone(), elapsed);
+                                        } else {
+                                            // Still within grace window, update last_details
+                                            w.lifecycle = LifecycleState::Recovering {
+                                                first_seen_ok: *first_seen_ok,
+                                                last_details: subservices,
+                                            };
+                                        }
+                                    }
+                                    LifecycleState::Degraded {
+                                        first_detected,
+                                        alert_sent,
+                                        ..
+                                    } => {
+                                        if all_ready {
+                                            w.lifecycle = LifecycleState::Healthy;
+                                            alert_action = AlertAction::SendOnline(w.clone());
+                                        } else {
+                                            w.lifecycle = LifecycleState::Degraded {
+                                                first_detected: *first_detected,
+                                                last_details: subservices,
+                                                alert_sent: *alert_sent,
+                                            };
+                                        }
+                                    }
+                                    LifecycleState::Healthy => {
+                                        if !all_ready {
+                                            // Previously healthy, now one or more subservices are down
+                                            w.lifecycle = LifecycleState::Recovering {
+                                                first_seen_ok: Instant::now(),
+                                                last_details: subservices,
+                                            };
                                         }
                                     }
                                 }
-                                _ => {
-                                    w.lifecycle = LifecycleState::DownPending {
-                                        first_detected_down: Instant::now(),
-                                        reason: format!("HTTP Status {}", status_code),
-                                    };
+                            } else {
+                                let status_code = status.as_u16();
+                                w.consecutive_failures += 1;
+                                w.is_healthy = false;
+
+                                match &w.lifecycle {
+                                    LifecycleState::DownConfirmed { .. } => {
+                                        // Already confirmed down, avoid alert spam
+                                    }
+                                    LifecycleState::DownPending {
+                                        first_detected_down,
+                                        ..
+                                    } => {
+                                        if w.consecutive_failures >= DOWN_CONFIRM_FAILURES {
+                                            w.lifecycle = LifecycleState::DownConfirmed {
+                                                since: *first_detected_down,
+                                                reason: format!("HTTP Status {}", status_code),
+                                            };
+                                            alert_action = AlertAction::SendHttpDegraded(
+                                                w.clone(),
+                                                status_code,
+                                            );
+                                            if let Some(hook) = &w.on_offline_hook {
+                                                hook_to_trigger =
+                                                    Some((w.name.clone(), hook.clone()));
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        w.lifecycle = LifecycleState::DownPending {
+                                            first_detected_down: Instant::now(),
+                                            reason: format!("HTTP Status {}", status_code),
+                                        };
+                                    }
                                 }
                             }
                         }

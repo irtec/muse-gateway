@@ -72,8 +72,11 @@ The `muse-agent` stack on each worker node is an **All-in-One Native Rust** exec
    - Runs as an asynchronous Tokio background worker (`role = "replica"`) that checks the `X-Cluster-Version` digest against master VM-01.
    - Pulls newly added or modified files into `~/workspace/public/` using temporary downloads (`.tmp`), SHA-256 validation, and atomic renames.
 5. **Service 5: Atomic Auto-Update Service:**
-   - Automatically detects binary updates synchronized to `public/files/muse-agent-installer/muse-agent`.
-   - Validates SHA-256 integrity, replaces the active binary (`agent/bin/muse-agent`) via atomic overwrite, and exits gracefully (`exit(0)`) to yield restart responsibility to the watchdog.
+   - Periodically monitors `~/workspace/public/files/muse-agent-installer/muse-agent` for newer binary versions propagated via one-way file sync.
+   - Enforces strict sanity checks: file existence, minimum size threshold (>= 2 MB), and SHA-256 cryptographic hash comparison against the running binary.
+   - If a new version is detected, copies it to a temporary sibling file (`agent/bin/muse-agent.update.<uuid>`), sets `0755` executable permissions, re-verifies the temp file's SHA-256 hash, and atomically replaces `agent/bin/muse-agent` using `std::fs::rename`.
+   - Exits cleanly (`exit(0)`) after a brief log flush delay, allowing systemd or the platform supervisor watchdog (`run.sh`) to instantly restart the daemon with the new binary.
+   - Combined with `muse-hub` active-standby routing, this provides zero-downtime rolling upgrades across all sandbox worker VMs.
 
 *(The **Axum File Manager Service (`:8080`)** is protected by PBKDF2-SHA256 authentication and deployed across all nodes, serving as Active Primary on Master VM-01 and Standby Failover on Replicas to power `files.yourdomain.com`).*
 
@@ -298,7 +301,7 @@ Adding extra worker nodes enables zero-downtime failover and load balancing.
 1. **Bootstrap Worker via Automated Script:**
    On the new VM, execute the one-line installer:
    ```bash
-   VM_ID=vm2 curl -fsSL -u admin:CHANGE_ME_PASSWORD https://files.yourdomain.com/files/muse-agent-installer/install.sh | bash
+   VM_ID=vm2 curl -fsSL https://raw.githubusercontent.com/irtec/muse-gateway/refs/heads/main/deploy/vm-bootstrap/install.sh | bash
    ```
 
 2. **Register Worker in Hub Configuration on Edge Gateway:**
@@ -327,7 +330,60 @@ Adding extra worker nodes enables zero-downtime failover and load balancing.
 
 ---
 
-## 7. Operational Verification & End-to-End Testing
+## 7. Fleet-Wide Rolling Auto-Update Workflow
+
+The `muse-agent` daemon contains a built-in atomic self-updating engine that enables rolling upgrades across all sandbox worker VMs without requiring manual SSH intervention or cluster downtime. Updates can be propagated either via automated **GitHub Releases** (version-based polling) or via internal **file sync**.
+
+```
+    GitHub Releases (v* tag push)                Master (VM-01)
+ ┌─────────────────────────────────┐       ┌─────────────────────────┐
+ │ CI/CD: Automated Musl Build     │       │ Local Mirror (Fallback) │
+ │ - version.txt                   │       │ public/files/           │
+ │ - muse-agent + muse-hub         │       │ muse-agent-installer/   │
+ │ - SHA-256 checksums             │       └───────────┬─────────────┘
+ └────────────────┬────────────────┘                   │
+                  │ (HTTP GET)                         │ (One-Way Sync)
+                  ▼                                    ▼
+       ┌────────────────────────────────────────────────────────┐
+       │ Replica Workers (VM-01..04 ProcessSupervisor)          │
+       │ 1. Check version.txt vs CARGO_PKG_VERSION              │
+       │ 2. Staggered Delay: (VM# - 1) * 20s (Anti-Split-Brain) │
+       │ 3. Download to temp file: muse-agent.update.<uuid>     │
+       │ 4. Integrity gate: Size >= 2 MB & SHA-256 verification │
+       │ 5. Atomic POSIX swap: rename(temp, active_bin)         │
+       │ 6. Log upgrade & graceful exit(0)                      │
+       └──────────────────────────┬─────────────────────────────┘
+                                  │
+                       ┌──────────▼──────────────┐
+                       │ Systemd / run.sh:       │
+                       │ Immediate respawn of    │
+                       │ the new binary version  │
+                       └─────────────────────────┘
+```
+
+### Auto-Update Mechanics & Invariants
+
+1. **Version-Based GitHub Releases Polling:**
+   - Background task on each agent polls `https://github.com/{github_repo}/releases/latest/download/version.txt` at configurable intervals (default: 30 minutes / 1800s).
+   - If `remote_version > current_version`, the upgrade pipeline triggers automatically.
+2. **Staggered Rolling Delay (Anti-Split-Brain / Zero Downtime):**
+   - Each VM calculates a non-overlapping sleep delay based on its VM number (e.g. VM-01: 0s, VM-02: 20s, VM-03: 40s, VM-04: 60s).
+   - `muse-hub` on the Edge Gateway routes incoming inference and file-manager requests to other active workers while one node restarts (~1–2 seconds).
+3. **Safety & Sanity Thresholds:**
+   - **Size Check:** The binary must be at least 2,000,000 bytes (2 MB) to prevent executing truncated or empty files.
+   - **Cryptographic Hash Validation:** Fetches `muse-agent.sha256` from GitHub Releases and validates the downloaded binary before replacing the active executable.
+4. **Atomic File Staging & Replacement:**
+   - The new executable is staged in a temporary file on the same filesystem (`agent/bin/muse-agent.update.<uuid>`).
+   - Permissions are explicitly set to `0755` (`rwxr-xr-x`).
+   - The SHA-256 hash of the temp file is verified against the remote hash to eliminate partial write risks.
+   - The active executable is atomically swapped using POSIX rename (`std::fs::rename`).
+5. **Graceful Handover & Supervisor Restart:**
+   - Once the file is replaced, `muse-agent` logs the successful upgrade with version and SHA-256 digests, waits 500 ms for log buffers to flush, and terminates cleanly via `std::process::exit(0)`.
+   - The registered service manager (`systemd` via `Restart=always` or the platform supervisor watchdog via `/home/hatch/workspace/agent/run.sh`) immediately launches the newly installed binary.
+
+---
+
+## 8. Operational Verification & End-to-End Testing
 
 ### 1. Cluster Health Check
 ```bash
@@ -405,7 +461,7 @@ curl -s -X POST https://api.yourdomain.com/v1/images/generations \
 
 ---
 
-## 8. Maintenance & Troubleshooting Procedures
+## 9. Maintenance & Troubleshooting Procedures
 
 1. **Inspect Hub Logs on Edge Gateway:**
    ```bash

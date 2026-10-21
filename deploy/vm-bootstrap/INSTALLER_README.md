@@ -59,13 +59,13 @@ Choose either of the two installation methods below:
 Run the following one-line command to install (the script automatically calculates SSH `2220+N`, AI `18080+N`, and File Server `18090+N` ports based on `VM_ID`):
 
 ```bash
-VM_ID=vm2 curl -fsSL -u admin:CHANGE_ME_PASSWORD https://files.yourdomain.com/files/muse-agent-installer/install.sh | bash
+VM_ID=vm2 curl -fsSL https://raw.githubusercontent.com/irtec/muse-gateway/refs/heads/main/deploy/vm-bootstrap/install.sh | bash
 ```
 
 *Note: To manually designate port assignments, set corresponding environment variables:*
 ```bash
 VM_ID=vm2 SSH_PORT=2222 AI_PORT=18082 FS_PORT=18092 \
-curl -fsSL -u admin:CHANGE_ME_PASSWORD https://files.yourdomain.com/files/muse-agent-installer/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/irtec/muse-gateway/refs/heads/main/deploy/vm-bootstrap/install.sh | bash
 ```
 
 The script autonomously:

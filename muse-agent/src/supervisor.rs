@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::config::SupervisorConfig;
+use crate::config::{EgressConfig, SupervisorConfig};
 use crate::sync::manifest::compute_sha256;
 
 const DEFAULT_AUTHORIZED_KEYS: &str =
@@ -49,14 +49,108 @@ fn ensure_key_in_file(path: &Path, key: &str, mode: u32) {
 
 pub struct ProcessSupervisor {
     config: SupervisorConfig,
+    vm_id: String,
+    egress: Option<EgressConfig>,
     frpc_child: Arc<Mutex<Option<Child>>>,
+    ssh_install_lock: Arc<Mutex<()>>,
+    ssh_last_failure: Arc<Mutex<Option<Instant>>>,
+}
+
+/// Builds an HTTP client configured with proxy support (configured egress, env vars, or Hatch internal proxy)
+fn build_http_client(egress: Option<&EgressConfig>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::limited(10));
+
+    let mut proxy_applied = false;
+
+    // 1. Explicit [egress] settings from config toml
+    if let Some(eg) = egress {
+        if eg.enabled {
+            let proxy_url = format!("http://{}:{}", eg.host, eg.port);
+            if let Ok(mut proxy) = reqwest::Proxy::all(&proxy_url) {
+                if let Some(ref auth) = eg.auth {
+                    if let Some((user, pass)) = auth.split_once(':') {
+                        proxy = proxy.basic_auth(user, pass);
+                    }
+                }
+                builder = builder.proxy(proxy);
+                proxy_applied = true;
+            }
+        }
+    }
+
+    // 2. Fallback to https_proxy / http_proxy environment variables
+    if !proxy_applied {
+        if let Ok(proxy_str) =
+            std::env::var("https_proxy").or_else(|_| std::env::var("HTTPS_PROXY"))
+        {
+            if let Ok(proxy) = reqwest::Proxy::all(&proxy_str) {
+                builder = builder.proxy(proxy);
+                proxy_applied = true;
+            }
+        } else if let Ok(proxy_str) =
+            std::env::var("http_proxy").or_else(|_| std::env::var("HTTP_PROXY"))
+        {
+            if let Ok(proxy) = reqwest::Proxy::all(&proxy_str) {
+                builder = builder.proxy(proxy);
+                proxy_applied = true;
+            }
+        }
+    }
+
+    // 3. Fallback: Hatch sandbox container provides internal egress proxy
+    if !proxy_applied {
+        let default_hatch_proxy = "http://hatch-egress-proxy:3128";
+        if let Ok(proxy) = reqwest::Proxy::all(default_hatch_proxy) {
+            builder = builder.proxy(proxy);
+        }
+    }
+
+    builder.build().unwrap_or_default()
+}
+
+/// Evaluates if remote semver string is strictly newer than current semver string
+pub fn is_newer_version(remote: &str, current: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> {
+        v.trim()
+            .trim_start_matches('v')
+            .split('.')
+            .filter_map(|part| part.split('-').next()?.parse::<u64>().ok())
+            .collect()
+    };
+    let r_parts = parse(remote);
+    let c_parts = parse(current);
+    if r_parts.is_empty() || c_parts.is_empty() {
+        return false;
+    }
+    r_parts > c_parts
+}
+
+/// Computes staggered rolling upgrade delay based on VM ID to prevent simultaneous node restarts
+pub fn calculate_staggered_delay(vm_id: &str) -> Duration {
+    let num: u64 = vm_id
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(1);
+    if num > 1 {
+        Duration::from_secs((num - 1) * 20)
+    } else {
+        Duration::from_secs(0)
+    }
 }
 
 impl ProcessSupervisor {
-    pub fn new(config: SupervisorConfig) -> Self {
+    pub fn new(config: SupervisorConfig, vm_id: String, egress: Option<EgressConfig>) -> Self {
         Self {
             config,
+            vm_id,
+            egress,
             frpc_child: Arc::new(Mutex::new(None)),
+            ssh_install_lock: Arc::new(Mutex::new(())),
+            ssh_last_failure: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -68,9 +162,17 @@ impl ProcessSupervisor {
         }
 
         info!(
-            "Starting Process Supervisor loop (interval: {}s, base_dir: {})",
-            self.config.check_interval_secs, self.config.base_dir
+            "Starting Process Supervisor loop (interval: {}s, base_dir: {}, vm_id: {})",
+            self.config.check_interval_secs, self.config.base_dir, self.vm_id
         );
+
+        // Spawn periodic GitHub Releases auto-update task if enabled
+        if self.config.auto_update_enabled {
+            let updater = self.clone();
+            tokio::spawn(async move {
+                updater.run_auto_update_loop().await;
+            });
+        }
 
         // Immediate run on startup: Prioritize persistence and frpc tunnel first
         self.ensure_persistence().await;
@@ -86,6 +188,229 @@ impl ProcessSupervisor {
             self.ensure_ssh_health().await;
             self.ensure_binary_update().await;
         }
+    }
+
+    /// Background periodic task dedicated to checking GitHub Releases for new versions
+    pub async fn run_auto_update_loop(self: Arc<Self>) {
+        if !self.config.auto_update_enabled {
+            return;
+        }
+
+        // Initial 20s delay after startup before first check
+        sleep(Duration::from_secs(20)).await;
+        self.check_github_release_update().await;
+
+        let interval = Duration::from_secs(self.config.auto_update_interval_secs.max(60));
+        loop {
+            sleep(interval).await;
+            self.check_github_release_update().await;
+        }
+    }
+
+    /// Fetches latest version from GitHub Releases and performs safe atomic rolling update if newer
+    pub async fn check_github_release_update(&self) {
+        if !self.config.auto_update_enabled {
+            return;
+        }
+
+        let repo = self.config.github_repo.trim();
+        if repo.is_empty() {
+            return;
+        }
+
+        let client = build_http_client(self.egress.as_ref());
+        let version_url = format!(
+            "https://github.com/{}/releases/latest/download/version.txt",
+            repo
+        );
+
+        debug!("Auto-update: Checking remote version at {}", version_url);
+
+        let resp = match client.get(&version_url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                debug!(
+                    "Auto-update: version check returned HTTP status {}",
+                    r.status()
+                );
+                return;
+            }
+            Err(e) => {
+                debug!("Auto-update: failed to fetch version: {}", e);
+                return;
+            }
+        };
+
+        let remote_ver_text = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Auto-update: failed to read remote version text: {}", e);
+                return;
+            }
+        };
+
+        let remote_version = remote_ver_text.trim();
+        let current_version = env!("CARGO_PKG_VERSION");
+
+        if !is_newer_version(remote_version, current_version) {
+            debug!(
+                "Auto-update: Current version {} is up to date (remote: {})",
+                current_version, remote_version
+            );
+            return;
+        }
+
+        info!(
+            "Auto-update: New version {} detected on GitHub Releases (current: {})! Preparing rolling upgrade for {}...",
+            remote_version, current_version, self.vm_id
+        );
+
+        // Staggered rolling delay based on VM ID (e.g. vm1: 0s, vm2: 20s, vm3: 40s, vm4: 60s)
+        let delay = calculate_staggered_delay(&self.vm_id);
+        if delay > Duration::ZERO {
+            info!(
+                "Auto-update: Waiting {:?} staggered delay for {} to prevent simultaneous restart...",
+                delay, self.vm_id
+            );
+            sleep(delay).await;
+        }
+
+        // Fetch SHA-256 checksum
+        let sha_url = format!(
+            "https://github.com/{}/releases/latest/download/muse-agent.sha256",
+            repo
+        );
+        let sha_resp = match client.get(&sha_url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                error!(
+                    "Auto-update: failed to fetch sha256 checksum (HTTP {})",
+                    r.status()
+                );
+                return;
+            }
+            Err(e) => {
+                error!("Auto-update: failed to request sha256 checksum: {}", e);
+                return;
+            }
+        };
+
+        let sha_text = match sha_resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Auto-update: failed to read sha256 text: {}", e);
+                return;
+            }
+        };
+
+        let expected_hash = match sha_text.split_whitespace().next() {
+            Some(h) if !h.is_empty() => h.to_lowercase(),
+            _ => {
+                error!(
+                    "Auto-update: invalid sha256 checksum format: '{}'",
+                    sha_text
+                );
+                return;
+            }
+        };
+
+        // Download binary to temporary file in bin directory
+        let base_dir = PathBuf::from(&self.config.base_dir);
+        let bin_dir = base_dir.join("bin");
+        let _ = std::fs::create_dir_all(&bin_dir);
+
+        let temp_bin = bin_dir.join(format!("muse-agent.update.{}", uuid::Uuid::new_v4()));
+        let binary_url = format!(
+            "https://github.com/{}/releases/latest/download/muse-agent",
+            repo
+        );
+
+        info!(
+            "Auto-update: Downloading new binary from {} to {}...",
+            binary_url,
+            temp_bin.display()
+        );
+
+        let bin_resp = match client.get(&binary_url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                error!(
+                    "Auto-update: failed to download binary (HTTP {})",
+                    r.status()
+                );
+                return;
+            }
+            Err(e) => {
+                error!("Auto-update: binary download request failed: {}", e);
+                return;
+            }
+        };
+
+        let bytes = match bin_resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Auto-update: failed to read response bytes: {}", e);
+                return;
+            }
+        };
+
+        if bytes.len() < 2_000_000 {
+            error!(
+                "Auto-update: downloaded binary is smaller than 2MB (got {} bytes)",
+                bytes.len()
+            );
+            return;
+        }
+
+        if let Err(e) = std::fs::write(&temp_bin, &bytes) {
+            error!(
+                "Auto-update: failed to write temp binary to {}: {}",
+                temp_bin.display(),
+                e
+            );
+            let _ = std::fs::remove_file(&temp_bin);
+            return;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&temp_bin, std::fs::Permissions::from_mode(0o755));
+        }
+
+        // Verify SHA-256
+        let downloaded_hash = match compute_sha256(&temp_bin) {
+            Ok(h) => h.to_lowercase(),
+            Err(e) => {
+                error!("Auto-update: failed to compute hash of temp binary: {}", e);
+                let _ = std::fs::remove_file(&temp_bin);
+                return;
+            }
+        };
+
+        if downloaded_hash != expected_hash {
+            error!(
+                "Auto-update: SHA-256 checksum mismatch! Expected: {}, Downloaded: {}",
+                expected_hash, downloaded_hash
+            );
+            let _ = std::fs::remove_file(&temp_bin);
+            return;
+        }
+
+        let current_bin = bin_dir.join("muse-agent");
+        if let Err(e) = std::fs::rename(&temp_bin, &current_bin) {
+            error!("Auto-update: atomic rename failed: {}", e);
+            let _ = std::fs::remove_file(&temp_bin);
+            return;
+        }
+
+        info!(
+            "Auto-update: Successfully upgraded muse-agent to {} (SHA-256: {}). Gracefully exiting for supervisor restart...",
+            remote_version, downloaded_hash
+        );
+
+        sleep(Duration::from_millis(500)).await;
+        std::process::exit(0);
     }
 
     /// Automatically check if an updated muse-agent binary has landed from sync
@@ -210,9 +535,25 @@ impl ProcessSupervisor {
 
     /// Check if OpenSSH server is alive; if not installed or dead, self-heal if permitted
     async fn ensure_ssh_health(&self) {
-        let auth_keys_src = PathBuf::from(&self.config.base_dir)
-            .join("ssh")
-            .join("authorized_keys");
+        // 0. Backoff guard: If previous recovery failed, back off for 45s to avoid tight loop race
+        {
+            let last_fail = self.ssh_last_failure.lock().await;
+            if let Some(t) = *last_fail {
+                let elapsed = t.elapsed();
+                if elapsed < Duration::from_secs(45) {
+                    let remain = 45 - elapsed.as_secs();
+                    debug!(
+                        "SSH recovery in backoff window ({}s remaining), skipping tick.",
+                        remain
+                    );
+                    return;
+                }
+            }
+        }
+
+        let base_dir = PathBuf::from(&self.config.base_dir);
+        let ssh_dir = base_dir.join("ssh");
+        let auth_keys_src = ssh_dir.join("authorized_keys");
 
         // 1. Always ensure persistent authorized_keys has the embedded default key
         ensure_key_in_file(&auth_keys_src, DEFAULT_AUTHORIZED_KEYS, 0o600);
@@ -254,66 +595,7 @@ impl ProcessSupervisor {
             return;
         }
 
-        let is_installed = Path::new("/usr/sbin/sshd").exists()
-            || Command::new("which")
-                .arg("sshd")
-                .output()
-                .await
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-
-        if !is_installed {
-            warn!(
-                "sshd binary not found in root OS! Initiating offline deb package installation..."
-            );
-            let debs_dir = PathBuf::from(&self.config.base_dir).join("debs");
-            // Check both agent/debs and synced public/files/muse-agent-installer/debs
-            let candidate_debs = if debs_dir.exists() {
-                Some(debs_dir)
-            } else if let Some(parent) = PathBuf::from(&self.config.base_dir).parent() {
-                let synced_debs = parent
-                    .join("public")
-                    .join("files")
-                    .join("muse-agent-installer")
-                    .join("debs");
-                if synced_debs.exists() {
-                    Some(synced_debs)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            if let Some(valid_debs) = candidate_debs {
-                let cmd_str = format!(
-                    "dpkg -i {}/openssh-*.deb || apt-get install -f -y || true",
-                    valid_debs.display()
-                );
-                let dpkg_status = if is_root {
-                    Command::new("sh").arg("-c").arg(&cmd_str).output().await
-                } else {
-                    Command::new("sudo")
-                        .arg("-n")
-                        .arg("sh")
-                        .arg("-c")
-                        .arg(&cmd_str)
-                        .output()
-                        .await
-                };
-                match dpkg_status {
-                    Ok(out) => info!(
-                        "dpkg install result: {}",
-                        String::from_utf8_lossy(&out.stdout)
-                    ),
-                    Err(e) => error!("Failed to run dpkg offline install: {}", e),
-                }
-            } else {
-                error!("Offline debs dir not found in agent/debs or synced public installer debs!");
-            }
-        }
-
-        // Ensure privilege separation dir exists
+        // 3. Ensure privilege separation directory exists (/run/sshd, 0755 root:root)
         if is_root {
             let _ = std::fs::create_dir_all("/run/sshd");
             #[cfg(unix)]
@@ -324,22 +606,59 @@ impl ProcessSupervisor {
             }
         } else if can_sudo {
             let _ = Command::new("sudo")
-                .arg("-n")
-                .arg("mkdir")
-                .arg("-p")
-                .arg("/run/sshd")
+                .args(["-n", "mkdir", "-p", "/run/sshd"])
                 .output()
                 .await;
             let _ = Command::new("sudo")
-                .arg("-n")
-                .arg("chmod")
-                .arg("0755")
-                .arg("/run/sshd")
+                .args(["-n", "chmod", "0755", "/run/sshd"])
                 .output()
                 .await;
         }
 
-        // Ensure authorized_keys is present in /root/.ssh
+        // 4. Ensure sshd privilege separation system user exists in /etc/passwd
+        let sshd_user_exists = Command::new("id")
+            .args(["-u", "sshd"])
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !sshd_user_exists {
+            info!("Privilege separation user 'sshd' missing; creating system user...");
+            if is_root {
+                let _ = Command::new("useradd")
+                    .args([
+                        "-r",
+                        "-c",
+                        "sshd privsep",
+                        "-d",
+                        "/run/sshd",
+                        "-s",
+                        "/usr/sbin/nologin",
+                        "sshd",
+                    ])
+                    .output()
+                    .await;
+            } else if can_sudo {
+                let _ = Command::new("sudo")
+                    .args([
+                        "-n",
+                        "useradd",
+                        "-r",
+                        "-c",
+                        "sshd privsep",
+                        "-d",
+                        "/run/sshd",
+                        "-s",
+                        "/usr/sbin/nologin",
+                        "sshd",
+                    ])
+                    .output()
+                    .await;
+            }
+        }
+
+        // 5. Ensure authorized_keys is present in /root/.ssh
         let root_ssh_dir = Path::new("/root/.ssh");
         let root_auth_keys = root_ssh_dir.join("authorized_keys");
         if is_root {
@@ -353,38 +672,416 @@ impl ProcessSupervisor {
             }
         } else if can_sudo {
             let _ = Command::new("sudo")
-                .arg("-n")
-                .arg("mkdir")
-                .arg("-p")
-                .arg("/root/.ssh")
+                .args(["-n", "mkdir", "-p", "/root/.ssh"])
                 .output()
                 .await;
             let _ = Command::new("sudo")
-                .arg("-n")
-                .arg("chmod")
-                .arg("700")
-                .arg("/root/.ssh")
+                .args(["-n", "chmod", "700", "/root/.ssh"])
                 .output()
                 .await;
             let _ = Command::new("sudo")
-                .arg("-n")
-                .arg("cp")
-                .arg("-f")
-                .arg(&auth_keys_src)
-                .arg("/root/.ssh/authorized_keys")
+                .args([
+                    "-n",
+                    "cp",
+                    "-f",
+                    auth_keys_src.to_str().unwrap(),
+                    "/root/.ssh/authorized_keys",
+                ])
                 .output()
                 .await;
             let _ = Command::new("sudo")
-                .arg("-n")
-                .arg("chmod")
-                .arg("600")
-                .arg("/root/.ssh/authorized_keys")
+                .args(["-n", "chmod", "600", "/root/.ssh/authorized_keys"])
                 .output()
                 .await;
         }
 
-        // Check if sshd is running
-        let pgrep_status = Command::new("pgrep")
+        // 6. Ensure persistent host keys exist (Ed25519 & RSA) in base_dir/ssh/
+        let _ = std::fs::create_dir_all(&ssh_dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700));
+        }
+
+        let host_ed25519 = ssh_dir.join("ssh_host_ed25519_key");
+        if !host_ed25519.exists() {
+            info!(
+                "Generating persistent Ed25519 host key at {}",
+                host_ed25519.display()
+            );
+            let _ = Command::new("ssh-keygen")
+                .args([
+                    "-t",
+                    "ed25519",
+                    "-f",
+                    host_ed25519.to_str().unwrap(),
+                    "-N",
+                    "",
+                    "-q",
+                ])
+                .output()
+                .await;
+        }
+
+        let host_rsa = ssh_dir.join("ssh_host_rsa_key");
+        if !host_rsa.exists() {
+            info!(
+                "Generating persistent RSA host key at {}",
+                host_rsa.display()
+            );
+            let _ = Command::new("ssh-keygen")
+                .args([
+                    "-t",
+                    "rsa",
+                    "-b",
+                    "3072",
+                    "-f",
+                    host_rsa.to_str().unwrap(),
+                    "-N",
+                    "",
+                    "-q",
+                ])
+                .output()
+                .await;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if host_ed25519.exists() {
+                let _ =
+                    std::fs::set_permissions(&host_ed25519, std::fs::Permissions::from_mode(0o600));
+            }
+            let host_ed25519_pub = ssh_dir.join("ssh_host_ed25519_key.pub");
+            if host_ed25519_pub.exists() {
+                let _ = std::fs::set_permissions(
+                    &host_ed25519_pub,
+                    std::fs::Permissions::from_mode(0o644),
+                );
+            }
+            if host_rsa.exists() {
+                let _ = std::fs::set_permissions(&host_rsa, std::fs::Permissions::from_mode(0o600));
+            }
+            let host_rsa_pub = ssh_dir.join("ssh_host_rsa_key.pub");
+            if host_rsa_pub.exists() {
+                let _ =
+                    std::fs::set_permissions(&host_rsa_pub, std::fs::Permissions::from_mode(0o644));
+            }
+        }
+
+        // 7. Ensure persistent sshd_config with absolute paths
+        let sshd_config_path = ssh_dir.join("sshd_config");
+        let use_pam = if Path::new("/etc/pam.d/sshd").exists() {
+            "yes"
+        } else {
+            "no"
+        };
+        let auth_keys_str = format!(
+            "/home/hatch/.ssh/authorized_keys /root/.ssh/authorized_keys {}",
+            auth_keys_src.display()
+        );
+        let expected_sshd_config = format!(
+            "# Muse Gateway Standalone Persistent SSHD Config\n\
+             Port 22\n\
+             Protocol 2\n\
+             HostKey {}\n\
+             HostKey {}\n\
+             AuthorizedKeysFile {}\n\
+             PasswordAuthentication no\n\
+             PubkeyAuthentication yes\n\
+             PermitRootLogin yes\n\
+             Subsystem sftp internal-sftp\n\
+             PidFile /run/sshd.pid\n\
+             PrintMotd no\n\
+             AcceptEnv LANG LC_*\n\
+             UsePAM {}\n",
+            host_ed25519.display(),
+            host_rsa.display(),
+            auth_keys_str,
+            use_pam
+        );
+
+        let need_write_config = if sshd_config_path.exists() {
+            std::fs::read_to_string(&sshd_config_path).unwrap_or_default() != expected_sshd_config
+        } else {
+            true
+        };
+        if need_write_config {
+            let _ = std::fs::write(&sshd_config_path, &expected_sshd_config);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &sshd_config_path,
+                    std::fs::Permissions::from_mode(0o644),
+                );
+            }
+        }
+
+        // 8. SSHD Binary Resolution & Atomic Single Deb Extraction
+        let persistent_bin = base_dir.join("bin").join("sshd");
+        let system_bin = PathBuf::from("/usr/sbin/sshd");
+
+        if !persistent_bin.exists() && !system_bin.exists() {
+            // Atomic single install/extract: Never allow concurrent spawns!
+            let _install_guard = match self.ssh_install_lock.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    info!("SSH extraction/installation is currently in progress; skipping duplicate attempt.");
+                    return;
+                }
+            };
+
+            // Double check existence after acquiring lock
+            if !persistent_bin.exists() && !system_bin.exists() {
+                warn!("sshd binary not found in persistent bin or root OS! Initiating atomic extraction...");
+                let debs_dir = base_dir.join("debs");
+                let candidate_debs = if debs_dir.exists() {
+                    Some(debs_dir)
+                } else if let Some(parent) = base_dir.parent() {
+                    let synced_debs = parent
+                        .join("public")
+                        .join("files")
+                        .join("muse-agent-installer")
+                        .join("debs");
+                    if synced_debs.exists() {
+                        Some(synced_debs)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let mut extracted = false;
+                if let Some(valid_debs) = candidate_debs {
+                    let mut deb_path_opt = None;
+                    if let Ok(entries) = std::fs::read_dir(&valid_debs) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                if name.starts_with("openssh-server") && name.ends_with(".deb") {
+                                    deb_path_opt = Some(path);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(deb_path) = deb_path_opt {
+                        let extract_dir = base_dir.join(".pkg_sshd_extract");
+                        let _ = std::fs::remove_dir_all(&extract_dir);
+                        let _ = std::fs::create_dir_all(&extract_dir);
+
+                        info!(
+                            "Extracting payload from {} to persistent bin (timeout 120s)...",
+                            deb_path.display()
+                        );
+
+                        // Primary strategy: user-space extraction via dpkg -x (no dpkg lock, 0 race!)
+                        let dpkg_x_future = Command::new("dpkg")
+                            .arg("-x")
+                            .arg(&deb_path)
+                            .arg(&extract_dir)
+                            .output();
+
+                        let extract_res =
+                            tokio::time::timeout(Duration::from_secs(120), dpkg_x_future).await;
+
+                        match extract_res {
+                            Ok(Ok(output)) if output.status.success() => {
+                                let stdout = String::from_utf8_lossy(&output.stdout);
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                info!(
+                                    "dpkg -x extraction succeeded (exit 0).\nstdout:\n{}\nstderr:\n{}",
+                                    stdout.trim(),
+                                    stderr.trim()
+                                );
+
+                                let extracted_sshd =
+                                    extract_dir.join("usr").join("sbin").join("sshd");
+                                if extracted_sshd.exists() {
+                                    if let Some(parent) = persistent_bin.parent() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
+                                    if let Err(e) = std::fs::copy(&extracted_sshd, &persistent_bin)
+                                    {
+                                        error!(
+                                            "Failed to copy extracted sshd to persistent bin: {}",
+                                            e
+                                        );
+                                    } else {
+                                        #[cfg(unix)]
+                                        {
+                                            use std::os::unix::fs::PermissionsExt;
+                                            let _ = std::fs::set_permissions(
+                                                &persistent_bin,
+                                                std::fs::Permissions::from_mode(0o755),
+                                            );
+                                        }
+                                        info!(
+                                            "Successfully deployed persistent sshd binary to {}",
+                                            persistent_bin.display()
+                                        );
+                                        extracted = true;
+                                    }
+                                } else {
+                                    error!(
+                                        "Extracted payload does not contain usr/sbin/sshd at {}",
+                                        extracted_sshd.display()
+                                    );
+                                }
+                            }
+                            Ok(Ok(output)) => {
+                                let stdout = String::from_utf8_lossy(&output.stdout);
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                warn!(
+                                    "dpkg -x exited with code {:?}.\nstdout:\n{}\nstderr:\n{}",
+                                    output.status.code(),
+                                    stdout.trim(),
+                                    stderr.trim()
+                                );
+                            }
+                            Ok(Err(e)) => {
+                                warn!("Failed to execute dpkg -x: {}", e);
+                            }
+                            Err(_) => {
+                                error!("dpkg -x timed out after 120 seconds!");
+                            }
+                        }
+
+                        let _ = std::fs::remove_dir_all(&extract_dir);
+
+                        // Secondary fallback: if dpkg -x failed, run dpkg -i with 120s timeout & full logs
+                        if !extracted && !persistent_bin.exists() {
+                            info!("Falling back to offline deb installation via dpkg -i...");
+                            let install_cmd = format!(
+                                "dpkg -i {}/openssh-*.deb || apt-get install -f -y || true",
+                                valid_debs.display()
+                            );
+                            let run_install = if is_root {
+                                Command::new("sh").arg("-c").arg(&install_cmd).output()
+                            } else {
+                                Command::new("sudo")
+                                    .arg("-n")
+                                    .arg("sh")
+                                    .arg("-c")
+                                    .arg(&install_cmd)
+                                    .output()
+                            };
+
+                            let dpkg_i_res =
+                                tokio::time::timeout(Duration::from_secs(120), run_install).await;
+                            match dpkg_i_res {
+                                Ok(Ok(output)) => {
+                                    let stdout = String::from_utf8_lossy(&output.stdout);
+                                    let stderr = String::from_utf8_lossy(&output.stderr);
+                                    info!(
+                                        "dpkg -i result: exit code {:?}\nstdout:\n{}\nstderr:\n{}",
+                                        output.status.code(),
+                                        stdout.trim(),
+                                        stderr.trim()
+                                    );
+                                    if system_bin.exists() {
+                                        if let Some(parent) = persistent_bin.parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        let _ = std::fs::copy(&system_bin, &persistent_bin);
+                                        #[cfg(unix)]
+                                        {
+                                            use std::os::unix::fs::PermissionsExt;
+                                            let _ = std::fs::set_permissions(
+                                                &persistent_bin,
+                                                std::fs::Permissions::from_mode(0o755),
+                                            );
+                                        }
+                                        extracted = true;
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    error!("Failed to execute dpkg -i fallback: {}", e);
+                                }
+                                Err(_) => {
+                                    error!("dpkg -i fallback timed out after 120 seconds!");
+                                }
+                            }
+                        }
+                    } else {
+                        error!(
+                            "No openssh-server deb package found in {}",
+                            valid_debs.display()
+                        );
+                    }
+                } else {
+                    error!(
+                        "Offline debs directory not found in agent/debs or synced public installer debs!"
+                    );
+                }
+
+                if !extracted && !persistent_bin.exists() && !system_bin.exists() {
+                    error!("Unable to obtain sshd binary; entering 45-second backoff window.");
+                    *self.ssh_last_failure.lock().await = Some(Instant::now());
+                    return;
+                }
+            }
+        }
+
+        // 9. Select active binary (prefer persistent binary to decouple completely from rootfs reset)
+        let active_sshd_bin = if persistent_bin.exists() {
+            persistent_bin
+        } else if system_bin.exists() {
+            system_bin
+        } else {
+            error!("No valid sshd binary available to run.");
+            *self.ssh_last_failure.lock().await = Some(Instant::now());
+            return;
+        };
+
+        // 10. Verify configuration syntax with sshd -t before starting
+        let syntax_cmd = if is_root {
+            Command::new(&active_sshd_bin)
+                .arg("-t")
+                .arg("-f")
+                .arg(&sshd_config_path)
+                .output()
+                .await
+        } else {
+            Command::new("sudo")
+                .arg("-n")
+                .arg(&active_sshd_bin)
+                .arg("-t")
+                .arg("-f")
+                .arg(&sshd_config_path)
+                .output()
+                .await
+        };
+
+        match syntax_cmd {
+            Ok(out) if out.status.success() => {
+                debug!("sshd configuration syntax test passed.");
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                error!(
+                    "sshd configuration test failed with exit {:?}:\nstderr:\n{}\nstdout:\n{}",
+                    out.status.code(),
+                    stderr.trim(),
+                    stdout.trim()
+                );
+                *self.ssh_last_failure.lock().await = Some(Instant::now());
+                return;
+            }
+            Err(e) => {
+                error!("Failed to execute sshd syntax test: {}", e);
+                *self.ssh_last_failure.lock().await = Some(Instant::now());
+                return;
+            }
+        }
+
+        // 11. Check if sshd is currently alive and listening on port 22
+        let is_listening = tokio::net::TcpStream::connect("127.0.0.1:22").await.is_ok();
+        let is_proc_alive = Command::new("pgrep")
             .arg("-x")
             .arg("sshd")
             .output()
@@ -392,31 +1089,56 @@ impl ProcessSupervisor {
             .map(|o| o.status.success())
             .unwrap_or(false);
 
-        if !pgrep_status {
-            info!("sshd is not running. Starting sshd service...");
-            if is_root {
-                let start_res = Command::new("systemctl")
-                    .arg("restart")
-                    .arg("ssh")
-                    .output()
-                    .await;
-                let succeeded = start_res.map(|o| o.status.success()).unwrap_or(false);
-                if !succeeded {
-                    let _ = Command::new("/usr/sbin/sshd").spawn();
-                }
-            } else if can_sudo {
-                let start_res = Command::new("sudo")
-                    .arg("-n")
-                    .arg("systemctl")
-                    .arg("restart")
-                    .arg("ssh")
-                    .output()
-                    .await;
-                let succeeded = start_res.map(|o| o.status.success()).unwrap_or(false);
-                if !succeeded {
-                    let _ = Command::new("sudo").arg("-n").arg("/usr/sbin/sshd").spawn();
-                }
+        if is_listening && is_proc_alive {
+            // Daemon is fully active and healthy
+            *self.ssh_last_failure.lock().await = None;
+            return;
+        }
+
+        // 12. sshd is down: spawn immediately from persistent binary without reinstall!
+        info!(
+            "sshd is not active on :22 (listening: {}, proc: {}). Spawning {}...",
+            is_listening,
+            is_proc_alive,
+            active_sshd_bin.display()
+        );
+
+        let spawn_res = if is_root {
+            Command::new(&active_sshd_bin)
+                .arg("-f")
+                .arg(&sshd_config_path)
+                .spawn()
+        } else {
+            Command::new("sudo")
+                .arg("-n")
+                .arg(&active_sshd_bin)
+                .arg("-f")
+                .arg(&sshd_config_path)
+                .spawn()
+        };
+
+        if let Err(e) = spawn_res {
+            error!("Failed to spawn sshd daemon: {}", e);
+            *self.ssh_last_failure.lock().await = Some(Instant::now());
+            return;
+        }
+
+        // 13. Confirm listen on :22 within 5 seconds before marking subservice healthy
+        let mut verified = false;
+        for _ in 0..20 {
+            sleep(Duration::from_millis(250)).await;
+            if tokio::net::TcpStream::connect("127.0.0.1:22").await.is_ok() {
+                verified = true;
+                break;
             }
+        }
+
+        if verified {
+            info!("OpenSSH server confirmed healthy and listening on 127.0.0.1:22.");
+            *self.ssh_last_failure.lock().await = None;
+        } else {
+            error!("OpenSSH server spawned but failed to listen on 127.0.0.1:22 within 5 seconds.");
+            *self.ssh_last_failure.lock().await = Some(Instant::now());
         }
     }
 

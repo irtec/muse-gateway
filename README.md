@@ -60,7 +60,7 @@ The project is structured into 3 core crates:
 - **Process Supervisor:** Manages the lifecycle of the `frpc` reverse tunnel with automatic crash respawn.
 - **SSH Self-Healing:** Ensures the OpenSSH server (`:22`) remains active and injects authorized SSH keys persistently across container resets.
 - **Native Sync Engine:** Autonomous one-way file synchronization from the Master node (VM-01) to replica workers.
-- **Atomic Auto-Update:** Detects synced binary upgrades, performs atomic replacement, and hands off graceful restart to the watchdog.
+- **Atomic Auto-Update:** Autonomous rolling updates without downtime; detects new binary releases synced to the local storage, validates SHA-256 integrity, performs an atomic filesystem swap, and cleanly hands off restart to systemd or the platform watchdog.
 - **File Manager (`:8080`):** Secure, PBKDF2-authenticated file server (serves as Active Primary on Master VM-01 and Standby Failover on Replicas).
 
 ---
@@ -102,7 +102,7 @@ Each worker node runs `muse-agent` alongside `frpc` to bridge AI inference, SSH,
 #### Automated One-Line Installation (Recommended)
 Run inside the target worker VM:
 ```bash
-VM_ID=vm2 curl -fsSL -u admin:YOUR_PASSWORD https://files.yourdomain.com/files/muse-agent-installer/install.sh | bash
+VM_ID=vm2 curl -fsSL https://raw.githubusercontent.com/irtec/muse-gateway/refs/heads/main/deploy/vm-bootstrap/install.sh | bash
 ```
 
 *Note: The script automatically calculates port assignments based on `VM_ID` (SSH: `2220+N`, AI: `18080+N`, File Server: `18090+N`). For detailed manual steps, see [`deploy/vm-bootstrap/INSTALLER_README.md`](./deploy/vm-bootstrap/INSTALLER_README.md).*

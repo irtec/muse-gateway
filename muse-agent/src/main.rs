@@ -61,7 +61,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 1. Run Autonomous Supervisor in background Tokio task
-    let supervisor = Arc::new(ProcessSupervisor::new(config.supervisor.clone()));
+    let supervisor = Arc::new(ProcessSupervisor::new(
+        config.supervisor.clone(),
+        config.vm.id.clone(),
+        config.egress.clone(),
+    ));
     let supervisor_clone = supervisor.clone();
     tokio::spawn(async move {
         supervisor_clone.run_loop().await;

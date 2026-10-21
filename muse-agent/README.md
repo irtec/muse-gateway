@@ -25,8 +25,10 @@ All-in-One Native Rust Worker Node Daemon & Service Supervisor.
    - Leverages sub-millisecond `X-Cluster-Version` digest comparisons and atomic writes (`.tmp` staging followed by atomic rename) to avoid serving partial reads.
 
 5. **Atomic Auto-Update Service:**
-   - Monitors `public/files/muse-agent-installer/muse-agent` for synced binary updates.
-   - Verifies SHA-256 integrity, replaces `agent/bin/muse-agent` atomically, and terminates cleanly (`exit(0)`) to yield process supervision to the watchdog for an immediate restart.
+   - Continuously monitors `~/workspace/public/files/muse-agent-installer/muse-agent` for newer binary releases propagated across the fleet via the file sync engine.
+   - Enforces strict safety checks: validates binary file existence, minimum size threshold (>= 2 MB), and SHA-256 hash divergence against the active executable.
+   - Safely stages updates to a temporary sibling file (`agent/bin/muse-agent.update.<uuid>`), sets executable permissions (`0755`), re-checks the SHA-256 digest, and performs an atomic filesystem swap (`std::fs::rename`).
+   - Terminates gracefully (`exit(0)`) after a 500 ms log flush window, letting systemd (`Restart=always`) or the platform supervisor watchdog (`run.sh`) immediately restart the updated daemon with zero cluster downtime.
 
 *(Note: The agent also includes the **Axum File Manager (`:8080`)**, which serves as Active Primary on Master VM-01 and Standby Failover on Replicas for `files.yourdomain.com`)*.
 

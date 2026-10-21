@@ -29,6 +29,9 @@ fi
 # ==============================================================================
 # [PHASE 1] Verify & Prepare Essential Directories
 # ==============================================================================
+# Clear any stale container nologin locks
+rm -f /run/nologin /etc/nologin 2>/dev/null || true
+
 # Ensure log directory and file permissions are preserved on persistent storage
 mkdir -p "${LOG_DIR}" 2>/dev/null || true
 chmod 755 "${BASE_DIR}/run.sh" 2>/dev/null || true
@@ -42,10 +45,17 @@ pkill -9 -f "socat.*17000" 2>/dev/null || true
 export MUSE_AGENT_CONFIG="${CONFIG_DIR}/muse-agent.toml"
 
 # Start native muse-agent binary if not already running
-if ! pgrep -f "${BIN_DIR}/muse-agent" >/dev/null 2>&1; then
-    echo "[run.sh] Starting native muse-agent daemon..."
-    nohup env MUSE_AGENT_CONFIG="${CONFIG_DIR}/muse-agent.toml" "${BIN_DIR}/muse-agent" >> "${LOG_DIR}/muse-agent.log" 2>&1 &
-    sleep 1
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet muse-agent.service 2>/dev/null; then
+    echo "[run.sh] muse-agent is managed by systemd and active."
+elif ! pgrep -f "${BIN_DIR}/muse-agent" >/dev/null 2>&1; then
+    if [ -f /etc/systemd/system/muse-agent.service ] && command -v systemctl >/dev/null 2>&1; then
+        ${SUDO_PREFIX:-} systemctl start muse-agent.service 2>/dev/null || true
+    fi
+    if ! pgrep -f "${BIN_DIR}/muse-agent" >/dev/null 2>&1; then
+        echo "[run.sh] Starting native muse-agent daemon..."
+        nohup env MUSE_AGENT_CONFIG="${CONFIG_DIR}/muse-agent.toml" "${BIN_DIR}/muse-agent" 200>&- >> "${LOG_DIR}/muse-agent.log" 2>&1 &
+        sleep 1
+    fi
 else
     echo "[run.sh] muse-agent is already running."
 fi
@@ -54,7 +64,7 @@ fi
 if ! pgrep -f "${BIN_DIR}/frpc" >/dev/null 2>&1; then
     if [ -f "${BIN_DIR}/frpc" ] && [ -f "${CONFIG_DIR}/frpc.toml" ]; then
         echo "[run.sh] Starting frpc tunnel to Edge Gateway..."
-        nohup "${BIN_DIR}/frpc" -c "${CONFIG_DIR}/frpc.toml" >> "${LOG_DIR}/frpc.log" 2>&1 &
+        nohup "${BIN_DIR}/frpc" -c "${CONFIG_DIR}/frpc.toml" 200>&- >> "${LOG_DIR}/frpc.log" 2>&1 &
         sleep 1
     fi
 else
@@ -72,7 +82,7 @@ if [ -f "${SSH_DIR}/authorized_keys" ]; then
 fi
 
 # ==============================================================================
-# [PHASE 4] OpenSSH Server Root OS Recovery (When Permitted / Privileged)
+# [PHASE 4] OpenSSH Server Root OS Recovery (Decoupled & Persistent)
 # ==============================================================================
 # Detect whether script is running as root or has passwordless sudo access
 IS_ROOT=0
@@ -84,67 +94,136 @@ elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
     CAN_SUDO=1
 fi
 
-if [ "${IS_ROOT}" -eq 1 ]; then
-    echo "[run.sh] Running root OpenSSH recovery..."
-    if ! command -v sshd >/dev/null 2>&1; then
-        if ls "${DEBS_DIR}"/openssh-server*.deb >/dev/null 2>&1; then
-            dpkg -i "${DEBS_DIR}"/openssh-*.deb || apt-get install -f -y || true
+SUDO_PREFIX=""
+if [ "${IS_ROOT}" -ne 1 ] && [ "${CAN_SUDO}" -eq 1 ]; then
+    SUDO_PREFIX="sudo -n"
+fi
+
+if [ "${IS_ROOT}" -eq 1 ] || [ "${CAN_SUDO}" -eq 1 ]; then
+    echo "[run.sh] Ensuring OpenSSH server availability (persistent binary mode)..."
+
+    # 1. Resolve or extract persistent sshd binary to decouple from rootfs reset
+    PERSISTENT_SSHD="${BIN_DIR}/sshd"
+    if [ ! -f "${PERSISTENT_SSHD}" ]; then
+        if [ -f /usr/sbin/sshd ]; then
+            echo "[run.sh] Caching rootfs /usr/sbin/sshd to persistent ${PERSISTENT_SSHD}..."
+            cp -f /usr/sbin/sshd "${PERSISTENT_SSHD}" 2>/dev/null || ${SUDO_PREFIX} cp -f /usr/sbin/sshd "${PERSISTENT_SSHD}" 2>/dev/null || true
+            chmod 755 "${PERSISTENT_SSHD}" 2>/dev/null || true
+        else
+            DEB_FILE=$(ls "${DEBS_DIR}"/openssh-server*.deb 2>/dev/null | head -n 1 || true)
+            if [ -z "${DEB_FILE}" ] && [ -d "${BASE_DIR}/../public/files/muse-agent-installer/debs" ]; then
+                DEB_FILE=$(ls "${BASE_DIR}/../public/files/muse-agent-installer/debs"/openssh-server*.deb 2>/dev/null | head -n 1 || true)
+            fi
+
+            if [ -n "${DEB_FILE}" ]; then
+                echo "[run.sh] Extracting sshd from ${DEB_FILE} to ${PERSISTENT_SSHD}..."
+                TMP_EXTRACT="/tmp/pkg_sshd_extract_$$"
+                rm -rf "${TMP_EXTRACT}" && mkdir -p "${TMP_EXTRACT}"
+                if dpkg -x "${DEB_FILE}" "${TMP_EXTRACT}" >/dev/null 2>&1; then
+                    if [ -f "${TMP_EXTRACT}/usr/sbin/sshd" ]; then
+                        cp -f "${TMP_EXTRACT}/usr/sbin/sshd" "${PERSISTENT_SSHD}"
+                        chmod 755 "${PERSISTENT_SSHD}"
+                        echo "[run.sh] Successfully extracted persistent sshd."
+                    fi
+                fi
+                rm -rf "${TMP_EXTRACT}"
+            fi
         fi
     fi
 
-    mkdir -p /run/sshd 2>/dev/null || true
-    chmod 0755 /run/sshd 2>/dev/null || true
+    # Determine which binary to run
+    ACTIVE_SSHD=""
+    if [ -f "${PERSISTENT_SSHD}" ] && [ -x "${PERSISTENT_SSHD}" ]; then
+        ACTIVE_SSHD="${PERSISTENT_SSHD}"
+    elif [ -f /usr/sbin/sshd ]; then
+        ACTIVE_SSHD="/usr/sbin/sshd"
+    fi
 
-    mkdir -p /root/.ssh 2>/dev/null || true
-    chmod 700 /root/.ssh 2>/dev/null || true
+    # 2. Prepare privilege separation directory (/run/sshd)
+    ${SUDO_PREFIX} mkdir -p /run/sshd 2>/dev/null || true
+    ${SUDO_PREFIX} chmod 0755 /run/sshd 2>/dev/null || true
+
+    # 3. Ensure system user 'sshd' exists
+    if ! id -u sshd >/dev/null 2>&1; then
+        ${SUDO_PREFIX} useradd -r -c "sshd privsep" -d /run/sshd -s /usr/sbin/nologin sshd 2>/dev/null || true
+    fi
+
+    # 4. Ensure persistent host keys exist in ${SSH_DIR}
+    mkdir -p "${SSH_DIR}" 2>/dev/null || true
+    chmod 700 "${SSH_DIR}" 2>/dev/null || true
+
+    HOST_ED25519="${SSH_DIR}/ssh_host_ed25519_key"
+    if [ ! -f "${HOST_ED25519}" ]; then
+        echo "[run.sh] Generating persistent Ed25519 host key..."
+        ssh-keygen -t ed25519 -f "${HOST_ED25519}" -N "" -q 2>/dev/null || true
+    fi
+
+    HOST_RSA="${SSH_DIR}/ssh_host_rsa_key"
+    if [ ! -f "${HOST_RSA}" ]; then
+        echo "[run.sh] Generating persistent RSA host key..."
+        ssh-keygen -t rsa -b 3072 -f "${HOST_RSA}" -N "" -q 2>/dev/null || true
+    fi
+
+    chmod 600 "${HOST_ED25519}" "${HOST_RSA}" 2>/dev/null || true
+    chmod 644 "${HOST_ED25519}.pub" "${HOST_RSA}.pub" 2>/dev/null || true
+
+    # 5. Ensure persistent sshd_config exists
+    SSHD_CONFIG="${SSH_DIR}/sshd_config"
+    USE_PAM="no"
+    if [ -f /etc/pam.d/sshd ]; then
+        USE_PAM="yes"
+    fi
+
+    cat << EOF > "${SSHD_CONFIG}"
+# Muse Gateway Standalone Persistent SSHD Config
+Port 22
+Protocol 2
+HostKey ${HOST_ED25519}
+HostKey ${HOST_RSA}
+AuthorizedKeysFile /home/hatch/.ssh/authorized_keys /root/.ssh/authorized_keys ${SSH_DIR}/authorized_keys
+PasswordAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin yes
+Subsystem sftp internal-sftp
+PidFile /run/sshd.pid
+PrintMotd no
+AcceptEnv LANG LC_*
+UsePAM ${USE_PAM}
+EOF
+    chmod 644 "${SSHD_CONFIG}" 2>/dev/null || true
+
+    # 6. Ensure root authorized_keys
+    ${SUDO_PREFIX} mkdir -p /root/.ssh 2>/dev/null || true
+    ${SUDO_PREFIX} chmod 700 /root/.ssh 2>/dev/null || true
     if [ -f "${SSH_DIR}/authorized_keys" ]; then
-        cp -f "${SSH_DIR}/authorized_keys" /root/.ssh/authorized_keys 2>/dev/null || true
-        chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
+        ${SUDO_PREFIX} cp -f "${SSH_DIR}/authorized_keys" /root/.ssh/authorized_keys 2>/dev/null || true
+        ${SUDO_PREFIX} chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
     fi
 
-    if ! pgrep -x sshd >/dev/null 2>&1; then
-        /usr/sbin/sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+    # 7. Start sshd if not currently listening on port 22
+    IS_LISTENING=0
+    if command -v nc >/dev/null 2>&1; then
+        nc -z 127.0.0.1 22 >/dev/null 2>&1 && IS_LISTENING=1 || true
+    elif command -v timeout >/dev/null 2>&1; then
+        timeout 1 bash -c "</dev/tcp/127.0.0.1/22" >/dev/null 2>&1 && IS_LISTENING=1 || true
     fi
 
-    # Automatically install and enable systemd service if not yet registered
+    if [ "${IS_LISTENING}" -eq 0 ] && [ -n "${ACTIVE_SSHD}" ]; then
+        if ${SUDO_PREFIX} "${ACTIVE_SSHD}" -t -f "${SSHD_CONFIG}" >/dev/null 2>&1; then
+            echo "[run.sh] Starting sshd using ${ACTIVE_SSHD}..."
+            ${SUDO_PREFIX} "${ACTIVE_SSHD}" -f "${SSHD_CONFIG}" 200>&- 2>/dev/null || true
+        fi
+    fi
+
+    # 8. Automatically install and enable systemd service if not yet registered
     if [ -f "${SYSTEMD_DIR}/muse-agent.service" ] && command -v systemctl >/dev/null 2>&1; then
         if [ ! -f /etc/systemd/system/muse-agent.service ]; then
-            cp -f "${SYSTEMD_DIR}/muse-agent.service" /etc/systemd/system/muse-agent.service
-            systemctl daemon-reload 2>/dev/null || true
-            systemctl enable muse-agent.service 2>/dev/null || true
-            echo "[run.sh] Successfully registered muse-agent.service with systemd."
-        fi
-    fi
-
-elif [ "${CAN_SUDO}" -eq 1 ]; then
-    echo "[run.sh] Running OpenSSH recovery via sudo..."
-    if ! command -v sshd >/dev/null 2>&1; then
-        if ls "${DEBS_DIR}"/openssh-server*.deb >/dev/null 2>&1; then
-            sudo -n dpkg -i "${DEBS_DIR}"/openssh-*.deb 2>/dev/null || sudo -n apt-get install -f -y 2>/dev/null || true
-        fi
-    fi
-
-    sudo -n mkdir -p /run/sshd 2>/dev/null || true
-    sudo -n chmod 0755 /run/sshd 2>/dev/null || true
-
-    sudo -n mkdir -p /root/.ssh 2>/dev/null || true
-    sudo -n chmod 700 /root/.ssh 2>/dev/null || true
-    if [ -f "${SSH_DIR}/authorized_keys" ]; then
-        sudo -n cp -f "${SSH_DIR}/authorized_keys" /root/.ssh/authorized_keys 2>/dev/null || true
-        sudo -n chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
-    fi
-
-    if ! pgrep -x sshd >/dev/null 2>&1; then
-        sudo -n /usr/sbin/sshd 2>/dev/null || sudo -n systemctl restart ssh 2>/dev/null || true
-    fi
-
-    # Automatically install and enable systemd service via sudo if not yet registered
-    if [ -f "${SYSTEMD_DIR}/muse-agent.service" ] && command -v systemctl >/dev/null 2>&1; then
-        if [ ! -f /etc/systemd/system/muse-agent.service ]; then
-            sudo -n cp -f "${SYSTEMD_DIR}/muse-agent.service" /etc/systemd/system/muse-agent.service 2>/dev/null || true
-            sudo -n systemctl daemon-reload 2>/dev/null || true
-            sudo -n systemctl enable muse-agent.service 2>/dev/null || true
-            echo "[run.sh] Successfully registered muse-agent.service with systemd via sudo."
+            ${SUDO_PREFIX} cp -f "${SYSTEMD_DIR}/muse-agent.service" /etc/systemd/system/muse-agent.service 2>/dev/null || true
+            ${SUDO_PREFIX} systemctl daemon-reload 2>/dev/null || true
+            ${SUDO_PREFIX} systemctl enable --now muse-agent.service 2>/dev/null || true
+            echo "[run.sh] Successfully registered and started muse-agent.service with systemd."
+        elif ! systemctl is-active --quiet muse-agent.service 2>/dev/null; then
+            ${SUDO_PREFIX} systemctl enable --now muse-agent.service 2>/dev/null || true
         fi
     fi
 else
@@ -152,3 +231,5 @@ else
 fi
 
 echo "[run.sh] Recovery complete."
+exec 200>&- 2>/dev/null || true
+exit 0
