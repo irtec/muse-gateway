@@ -126,6 +126,33 @@ fn test_clean_error_reason() {
         ),
         "Network / DNS Resolution Failed"
     );
+    assert_eq!(
+        clean_error_reason("error sending request for url (http://127.0.0.1:18081/health)"),
+        "error sending request for url"
+    );
+}
+
+#[tokio::test]
+async fn test_describe_error_preserves_root_cause() {
+    use muse_hub::pool::{clean_error_reason, describe_error};
+
+    // Nothing listens on port 1, so the connect is refused immediately.
+    let err = reqwest::Client::new()
+        .get("http://127.0.0.1:1/health")
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .expect_err("connect to closed port must fail");
+
+    let described = describe_error(&err);
+    assert!(
+        described.to_lowercase().contains("connection refused"),
+        "expected root cause in chain, got: {described}"
+    );
+    assert_eq!(
+        clean_error_reason(&described),
+        "Connection Refused (Daemon/Tunnel Disconnected)"
+    );
 }
 
 #[test]

@@ -115,6 +115,8 @@ pub fn clean_error_reason(err: &str) -> String {
         "Timeout / Unresponsive (>3s)".to_string()
     } else if lower.contains("dns") || lower.contains("resolve") {
         "Network / DNS Resolution Failed".to_string()
+    } else if lower.contains("connection reset") {
+        "Connection Reset by Peer".to_string()
     } else {
         let clean = err.split('(').next().unwrap_or(err).trim();
         if clean.len() > 60 {
@@ -125,6 +127,18 @@ pub fn clean_error_reason(err: &str) -> String {
             clean.to_string()
         }
     }
+}
+
+/// Flattens a reqwest error with its source chain so the root cause survives
+/// (e.g. "error sending request ...: tcp connect error: Connection refused (os error 111)").
+pub fn describe_error(err: &reqwest::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        parts.push(cause.to_string());
+        source = cause.source();
+    }
+    parts.join(": ")
 }
 
 pub fn format_subservice_checklist(s: &SubservicesStatus) -> String {
@@ -802,7 +816,7 @@ impl WorkerPool {
                             }
                         }
                         Err(e) => {
-                            let err_str = e.to_string();
+                            let err_str = describe_error(&e);
                             w.consecutive_failures += 1;
                             w.is_healthy = false;
 
