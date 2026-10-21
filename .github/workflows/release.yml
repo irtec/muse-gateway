@@ -2,21 +2,48 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
   workflow_dispatch:
-    inputs:
-      tag_name:
-        description: 'Tag name to release (e.g. v0.1.1)'
-        required: false
-        default: ''
 
 permissions:
   contents: write
 
 jobs:
+  check-version:
+    name: Check Version Bump
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Inspect Cargo.toml Version & GitHub Releases
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)
+          TAG="v${CARGO_VERSION}"
+          echo "Current workspace version in Cargo.toml: ${CARGO_VERSION}"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists on GitHub. Skipping release build."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New unreleased version detected: ${TAG}! Triggering release build..."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
   build-and-release:
-    name: Build & Release Musl Binaries
+    name: Build & Publish Release
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -32,29 +59,6 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
 
-      - name: Determine & validate version
-        id: get_version
-        run: |
-          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)
-          echo "Cargo.toml workspace version is: ${CARGO_VERSION}"
-
-          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
-            TAG="${{ github.event.inputs.tag_name }}"
-          else
-            TAG="${GITHUB_REF#refs/tags/}"
-          fi
-
-          VERSION="${TAG#v}"
-          if [ "${VERSION}" != "${CARGO_VERSION}" ]; then
-            echo "ERROR: Git tag version (${VERSION}) does not match Cargo.toml version (${CARGO_VERSION})!"
-            echo "Please update [workspace.package] version in Cargo.toml to match ${VERSION} before releasing."
-            exit 1
-          fi
-
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "${VERSION}" > version.txt
-
       - name: Build release binaries
         run: |
           cargo build --release --target x86_64-unknown-linux-musl -p muse-agent
@@ -62,10 +66,11 @@ jobs:
 
       - name: Prepare release artifacts & checksums
         run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
           mkdir -p artifacts
           cp target/x86_64-unknown-linux-musl/release/muse-agent artifacts/muse-agent
           cp target/x86_64-unknown-linux-musl/release/muse-hub artifacts/muse-hub
-          cp version.txt artifacts/version.txt
+          echo "${VERSION}" > artifacts/version.txt
           cd artifacts
           sha256sum muse-agent | awk '{print $1}' > muse-agent.sha256
           sha256sum muse-hub | awk '{print $1}' > muse-hub.sha256
@@ -74,8 +79,8 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.get_version.outputs.tag }}
-          name: Release ${{ steps.get_version.outputs.tag }}
+          tag_name: ${{ needs.check-version.outputs.tag }}
+          name: Release ${{ needs.check-version.outputs.tag }}
           files: |
             artifacts/muse-agent
             artifacts/muse-hub
@@ -85,3 +90,4 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+
