@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "muse-core",
+    "muse-agent",
+    "muse-hub",
+]
+resolver = "2"

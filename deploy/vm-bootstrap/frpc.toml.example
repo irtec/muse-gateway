@@ -1,0 +1,29 @@
+serverAddr = "YOUR_EDGE_IP"
+serverPort = 7000
+auth.method = "token"
+auth.token = "YOUR_FRP_SECRET_TOKEN"
+log.to = "/home/hatch/workspace/agent/logs/frpc.log"
+log.level = "info"
+log.maxDays = 3
+
+[[proxies]]
+name = "ssh-{{VM_ID}}"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = {{SSH_PORT}}
+
+[[proxies]]
+name = "muse-ai-{{VM_ID}}"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 11436
+remotePort = {{AI_PORT}}
+
+[[proxies]]
+name = "file-server-{{VM_ID}}"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8080
+remotePort = {{FILE_SERVER_PORT}}
+

@@ -1,0 +1,39 @@
+# ==============================================================================
+# muse-hub Configuration Example
+# Location: /etc/muse-hub/config.toml
+# ==============================================================================
+
+[server]
+# Local bind interface and port (proxied by Nginx SSL on port 443)
+host = "127.0.0.1"
+http_port = 18080
+file_server_port = 18090 # Dedicated active-standby failover file server listener port
+
+# Optional global API key to restrict public client access
+# api_key = "sk-optional-cluster-key"
+
+[pool]
+# Structured inference worker registry (supports multi-VM cluster configurations)
+# file_server_port maps to worker frpc tunnel ports: VM1=18091, VM2=18092, VM3=18093
+workers = [
+    { name = "VM-01 (Prod)", url = "http://127.0.0.1:18081", ssh_port = 2221, file_server_port = 18091 },
+    # Add secondary worker when expanding cluster capacity:
+    # { name = "VM-02 (Backup)", url = "http://127.0.0.1:18082", ssh_port = 2222, file_server_port = 18092 },
+]
+
+# Legacy target URL fallback
+targets = [
+    "http://127.0.0.1:18081"
+]
+
+# Periodic health check interval per worker (seconds)
+health_check_interval_secs = 5
+
+# Maximum timeout per AI request before triggering failover (seconds)
+request_timeout_secs = 120
+
+[telegram]
+# Real-time worker status alerts (Online, Offline, Recovered, Critical Pool Down)
+enabled = false
+bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
+chat_id = "YOUR_TELEGRAM_CHAT_ID"

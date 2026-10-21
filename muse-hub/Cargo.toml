@@ -1,0 +1,25 @@
+[package]
+name = "muse-hub"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+muse-core = { path = "../muse-core" }
+tokio = { version = "1.38", features = ["full"] }
+axum = { version = "0.7", features = ["macros"] }
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bytes = "1.6"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+
+[dev-dependencies]
+muse-agent = { path = "../muse-agent" }
+tempfile = "3.10"

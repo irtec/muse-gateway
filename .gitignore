@@ -1,0 +1,20 @@
+.env
+.clapi
+.neucode
+/target
+**/*.rs.bk
+Cargo.lock
+*.bak
+test-*
+NEUCODE.md
+
+# Build & deployment artifacts
+deploy/dist/
+
+# Real production configs (keep only *.example in git)
+deploy/edge/config.toml
+deploy/edge/frps.toml
+deploy/edge/nginx-muse.conf
+deploy/edge/files-muse.conf
+deploy/vm-bootstrap/config/*.toml
+!deploy/vm-bootstrap/config/*.example

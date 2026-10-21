@@ -1,0 +1,16 @@
+bindPort = 7000
+vhostHTTPPort = 8081
+auth.method = "token"
+auth.token = "YOUR_FRP_SECRET_TOKEN"
+webServer.addr = "127.0.0.1"
+webServer.port = 7500
+webServer.user = "admin"
+webServer.password = "YOUR_FRP_WEB_PASSWORD"
+log.to = "/var/log/frps.log"
+log.level = "info"
+log.maxDays = 7
+allowPorts = [
+  { start = 18081, end = 18100 },
+  { start = 2221, end = 2230 },
+  { start = 20000, end = 30000 }
+]

@@ -1,0 +1,38 @@
+[vm]
+id = "{{VM_ID}}"
+token = "YOUR_CLUSTER_SECRET_TOKEN"
+
+[server]
+host = "127.0.0.1"
+port = 11436
+
+[inference]
+socket_path = "/run/hatch/sandbox/space-inference.sock"
+media_socket_path = "/run/hatch/sandbox/space-media.sock"
+max_frame_size_mb = 64
+
+[supervisor]
+enabled = true
+check_interval_secs = 5
+base_dir = "/home/hatch/workspace/agent"
+frpc_bin = "/home/hatch/workspace/agent/bin/frpc"
+frpc_config = "/home/hatch/workspace/agent/config/frpc.toml"
+
+# Active-Standby File Server: Enabled so the worker is prepared for failover file serving
+[file_manager]
+enabled = true
+host = "127.0.0.1"
+port = 8080
+root_dir = "/home/hatch/workspace/public"
+auth_user = "admin"
+auth_salt = "00000000000000000000000000000000"
+auth_hash = "0000000000000000000000000000000000000000000000000000000000000000"
+
+# Sync Engine: Worker operates as a read-only replica backup of Master VM-01
+[sync]
+enabled = true
+role = "replica"
+sync_dir = "/home/hatch/workspace/public"
+master_url = "https://files.yourdomain.com"
+auth_token = "YOUR_CLUSTER_SECRET_TOKEN"
+interval_secs = 15

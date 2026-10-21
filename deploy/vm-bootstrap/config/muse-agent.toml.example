@@ -1,0 +1,55 @@
+# ==============================================================================
+# muse-agent Configuration Example
+# File: /home/hatch/workspace/agent/config/muse-agent.toml
+# ==============================================================================
+
+[vm]
+# Worker node identity and inbound request authentication token
+id = "vm1"
+token = "YOUR_CLUSTER_SECRET_TOKEN"
+
+[server]
+# Local HTTP server bind address inside the VM (forwarded to Edge Gateway via frpc)
+host = "127.0.0.1"
+port = 11436
+
+[inference]
+# Platform internal Unix Domain Sockets for LLM inference & media execution
+socket_path = "/run/hatch/sandbox/space-inference.sock"
+media_socket_path = "/run/hatch/sandbox/space-media.sock"
+max_frame_size_mb = 64
+
+[supervisor]
+# Internal supervisor for peripheral processes (frpc reverse tunnel & OpenSSH)
+enabled = true
+check_interval_secs = 5
+base_dir = "/home/hatch/workspace/agent"
+frpc_bin = "/home/hatch/workspace/agent/bin/frpc"
+frpc_config = "/home/hatch/workspace/agent/config/frpc.toml"
+
+[file_manager]
+# Native Axum file server powering files.yourdomain.com
+enabled = true
+host = "127.0.0.1"
+port = 8080
+root_dir = "/home/hatch/workspace/public"
+auth_user = "admin"
+auth_salt = "00000000000000000000000000000000"
+auth_hash = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[sync]
+# In-Agent One-Way Sync Engine (Master VM-01 <-> Worker Replica)
+# On replica worker nodes (VM-02, VM-03, etc.), enable this feature for automated file mirroring
+enabled = true
+role = "replica"
+master_url = "https://files.yourdomain.com"
+auth_token = "YOUR_CLUSTER_SECRET_TOKEN"
+sync_dir = "/home/hatch/workspace/public"
+interval_secs = 15
+
+# [egress]
+# HTTP egress proxy option if the sandbox environment restricts direct outbound connectivity
+# enabled = false
+# host = "hatch-egress-proxy"
+# port = 3128
+# auth = "user:password"

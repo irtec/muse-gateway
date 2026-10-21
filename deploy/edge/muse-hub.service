@@ -1,0 +1,16 @@
+[Unit]
+Description=Muse Gateway Hub (Central Load Balancer & Health Monitor)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/muse-hub
+ExecStart=/usr/local/bin/muse-hub
+Restart=always
+RestartSec=5s
+Environment=MUSE_HUB_CONFIG=/etc/muse-hub/config.toml
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
