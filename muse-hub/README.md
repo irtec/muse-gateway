@@ -26,6 +26,9 @@ Central AI Gateway, Dynamic Load Balancer, and Health Monitoring Hub.
    - **Subservice Checklist:** Queries and evaluates individual worker subsystems (`ai_bridge`, `uds_socket`, `sshd`, `storage`).
    - **UP Notification:** Broadcast immediately when 100% of subservices report ready (`🟢 HEALTHY`). If startup is gradual, a 5-minute grace window is granted before issuing a `🟡 DEGRADED` notification detailing any lagging subservices.
    - **DOWN Notification Debounce:** While AI traffic failover occurs instantaneously, Telegram `🔴 OFFLINE` alert triggers are debounced through a confirmed-failure state machine to eliminate alerting noise caused by transient network blips.
+   - **Node Version:** Every alert carries the reported `muse-agent` version of the affected node.
+   - **Cluster Fleet Overview:** Each alert embeds a per-node breakdown in definition order (`🟢 Healthy`, `🟡 Degraded`, `🔴 Offline` with reason) so operators see the whole fleet state without querying `/health`.
+   - **Auto-Update Notifications:** `🚀 Auto-Update Successful` reports `old ➔ new` version on the first health check after an upgrade; `⚠️ Auto-Update Failed` reports the agent's `update_error` once per distinct error message.
 
 ---
 
