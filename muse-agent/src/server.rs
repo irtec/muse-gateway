@@ -15,6 +15,7 @@ use crate::models::{
     AnthropicRequest, ChatCompletionRequest, ImageGenerationRequest, UdsMediaRequest,
     UdsMediaResponse, UdsResponse,
 };
+use crate::supervisor::ProcessSupervisor;
 use crate::translator::{
     convert_anthropic_to_uds, convert_openai_to_uds, extract_uds_content_text,
     format_uds_to_anthropic, format_uds_to_anthropic_stream, format_uds_to_openai,
@@ -27,6 +28,7 @@ pub struct AppState {
     pub config: AgentConfig,
     pub uds_client: Arc<UdsClient>,
     pub media_client: Arc<UdsClient>,
+    pub supervisor: Arc<ProcessSupervisor>,
 }
 
 pub fn create_agent_router(state: AppState) -> Router {
@@ -122,6 +124,7 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         json!({
             "status": status_str,
             "vm_id": state.config.vm.id,
+            "version": env!("CARGO_PKG_VERSION"),
             "role": if state.config.file_manager.enabled { "master" } else { "replica" },
             "uds_ready": uds_ready,
             "all_ready": all_subservices_ready,
@@ -131,6 +134,7 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
                 "sshd": sshd_ready,
                 "storage": storage_ready
             },
+            "update_error": state.supervisor.last_update_error(),
             "ok": all_subservices_ready
         })
         .to_string(),

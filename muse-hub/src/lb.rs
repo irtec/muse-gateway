@@ -159,6 +159,9 @@ async fn health_check_handler(State(state): State<AppState>) -> impl IntoRespons
                 "url": w.url,
                 "ssh_port": w.ssh_port,
                 "healthy": w.healthy,
+                "version": w.version,
+                "role": w.role,
+                "last_update_error": w.last_update_error,
                 "last_checked_secs_ago": w.last_checked_secs_ago,
                 "active_requests": w.active_requests
             })

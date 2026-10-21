@@ -54,6 +54,7 @@ pub struct ProcessSupervisor {
     frpc_child: Arc<Mutex<Option<Child>>>,
     ssh_install_lock: Arc<Mutex<()>>,
     ssh_last_failure: Arc<Mutex<Option<Instant>>>,
+    last_update_error: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Builds an HTTP client configured with proxy support (configured egress, env vars, or Hatch internal proxy)
@@ -151,6 +152,26 @@ impl ProcessSupervisor {
             frpc_child: Arc::new(Mutex::new(None)),
             ssh_install_lock: Arc::new(Mutex::new(())),
             ssh_last_failure: Arc::new(Mutex::new(None)),
+            last_update_error: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    pub fn last_update_error(&self) -> Option<String> {
+        self.last_update_error
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    pub fn set_update_error(&self, err: String) {
+        if let Ok(mut guard) = self.last_update_error.lock() {
+            *guard = Some(err);
+        }
+    }
+
+    pub fn clear_update_error(&self) {
+        if let Ok(mut guard) = self.last_update_error.lock() {
+            *guard = None;
         }
     }
 
@@ -283,14 +304,15 @@ impl ProcessSupervisor {
         let sha_resp = match client.get(&sha_url).send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                error!(
-                    "Auto-update: failed to fetch sha256 checksum (HTTP {})",
-                    r.status()
-                );
+                let err = format!("Failed to fetch sha256 checksum (HTTP {})", r.status());
+                error!("Auto-update: {}", err);
+                self.set_update_error(err);
                 return;
             }
             Err(e) => {
-                error!("Auto-update: failed to request sha256 checksum: {}", e);
+                let err = format!("Failed to request sha256 checksum: {}", e);
+                error!("Auto-update: {}", err);
+                self.set_update_error(err);
                 return;
             }
         };
@@ -298,7 +320,9 @@ impl ProcessSupervisor {
         let sha_text = match sha_resp.text().await {
             Ok(t) => t,
             Err(e) => {
-                error!("Auto-update: failed to read sha256 text: {}", e);
+                let err = format!("Failed to read sha256 text: {}", e);
+                error!("Auto-update: {}", err);
+                self.set_update_error(err);
                 return;
             }
         };
@@ -306,10 +330,9 @@ impl ProcessSupervisor {
         let expected_hash = match sha_text.split_whitespace().next() {
             Some(h) if !h.is_empty() => h.to_lowercase(),
             _ => {
-                error!(
-                    "Auto-update: invalid sha256 checksum format: '{}'",
-                    sha_text
-                );
+                let err = format!("Invalid sha256 checksum format: '{}'", sha_text);
+                error!("Auto-update: {}", err);
+                self.set_update_error(err);
                 return;
             }
         };
@@ -334,14 +357,15 @@ impl ProcessSupervisor {
         let bin_resp = match client.get(&binary_url).send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                error!(
-                    "Auto-update: failed to download binary (HTTP {})",
-                    r.status()
-                );
+                let err = format!("Failed to download binary (HTTP {})", r.status());
+                error!("Auto-update: {}", err);
+                self.set_update_error(err);
                 return;
             }
             Err(e) => {
-                error!("Auto-update: binary download request failed: {}", e);
+                let err = format!("Binary download request failed: {}", e);
+                error!("Auto-update: {}", err);
+                self.set_update_error(err);
                 return;
             }
         };
@@ -349,25 +373,31 @@ impl ProcessSupervisor {
         let bytes = match bin_resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
-                error!("Auto-update: failed to read response bytes: {}", e);
+                let err = format!("Failed to read response bytes: {}", e);
+                error!("Auto-update: {}", err);
+                self.set_update_error(err);
                 return;
             }
         };
 
         if bytes.len() < 2_000_000 {
-            error!(
-                "Auto-update: downloaded binary is smaller than 2MB (got {} bytes)",
+            let err = format!(
+                "Downloaded binary is smaller than 2MB (got {} bytes)",
                 bytes.len()
             );
+            error!("Auto-update: {}", err);
+            self.set_update_error(err);
             return;
         }
 
         if let Err(e) = std::fs::write(&temp_bin, &bytes) {
-            error!(
-                "Auto-update: failed to write temp binary to {}: {}",
+            let err = format!(
+                "Failed to write temp binary to {}: {}",
                 temp_bin.display(),
                 e
             );
+            error!("Auto-update: {}", err);
+            self.set_update_error(err);
             let _ = std::fs::remove_file(&temp_bin);
             return;
         }
@@ -382,27 +412,35 @@ impl ProcessSupervisor {
         let downloaded_hash = match compute_sha256(&temp_bin) {
             Ok(h) => h.to_lowercase(),
             Err(e) => {
-                error!("Auto-update: failed to compute hash of temp binary: {}", e);
+                let err = format!("Failed to compute hash of temp binary: {}", e);
+                error!("Auto-update: {}", err);
+                self.set_update_error(err);
                 let _ = std::fs::remove_file(&temp_bin);
                 return;
             }
         };
 
         if downloaded_hash != expected_hash {
-            error!(
-                "Auto-update: SHA-256 checksum mismatch! Expected: {}, Downloaded: {}",
+            let err = format!(
+                "SHA-256 checksum mismatch! Expected: {}, Downloaded: {}",
                 expected_hash, downloaded_hash
             );
+            error!("Auto-update: {}", err);
+            self.set_update_error(err);
             let _ = std::fs::remove_file(&temp_bin);
             return;
         }
 
         let current_bin = bin_dir.join("muse-agent");
         if let Err(e) = std::fs::rename(&temp_bin, &current_bin) {
-            error!("Auto-update: atomic rename failed: {}", e);
+            let err = format!("Atomic rename failed: {}", e);
+            error!("Auto-update: {}", err);
+            self.set_update_error(err);
             let _ = std::fs::remove_file(&temp_bin);
             return;
         }
+
+        self.clear_update_error();
 
         info!(
             "Auto-update: Successfully upgraded muse-agent to {} (SHA-256: {}). Gracefully exiting for supervisor restart...",

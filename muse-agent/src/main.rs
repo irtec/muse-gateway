@@ -86,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
         uds_client,
         media_client,
+        supervisor: supervisor.clone(),
     };
 
     let app = create_agent_router(state);

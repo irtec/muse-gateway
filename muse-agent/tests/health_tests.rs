@@ -2,7 +2,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use muse_agent::{create_agent_router, AgentConfig, AppState, UdsClient};
+use muse_agent::{create_agent_router, AgentConfig, AppState, ProcessSupervisor, UdsClient};
 use serde_json::Value;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -17,11 +17,17 @@ async fn test_health_check_degraded_returns_503() {
 
     let uds_client = Arc::new(UdsClient::new("/tmp/non_existent_uds_socket.sock", None));
     let media_client = Arc::new(UdsClient::new("/tmp/non_existent_media_socket.sock", None));
+    let supervisor = Arc::new(ProcessSupervisor::new(
+        config.supervisor.clone(),
+        config.vm.id.clone(),
+        None,
+    ));
 
     let state = AppState {
         config,
         uds_client,
         media_client,
+        supervisor,
     };
 
     let app = create_agent_router(state);
@@ -45,4 +51,5 @@ async fn test_health_check_degraded_returns_503() {
     assert_eq!(json["status"], "degraded");
     assert_eq!(json["all_ready"], false);
     assert_eq!(json["subservices"]["ai_bridge"], true);
+    assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
 }

@@ -75,6 +75,10 @@ pub struct WorkerStatus {
     pub active_requests: Arc<AtomicUsize>,
     pub lifecycle: LifecycleState,
     pub subservices: SubservicesStatus,
+    pub version: Option<String>,
+    pub role: Option<String>,
+    pub last_update_error: Option<String>,
+    pub reported_update_error: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -87,6 +91,9 @@ pub struct WorkerSummary {
     pub last_checked_secs_ago: u64,
     pub active_requests: usize,
     pub subservices: SubservicesStatus,
+    pub version: Option<String>,
+    pub role: Option<String>,
+    pub last_update_error: Option<String>,
 }
 
 pub struct WorkerPool {
@@ -97,7 +104,7 @@ pub struct WorkerPool {
     client: reqwest::Client,
 }
 
-fn clean_error_reason(err: &str) -> String {
+pub fn clean_error_reason(err: &str) -> String {
     let lower = err.to_lowercase();
     if lower.contains("connection refused")
         || lower.contains("os error 111")
@@ -120,7 +127,7 @@ fn clean_error_reason(err: &str) -> String {
     }
 }
 
-fn format_subservice_checklist(s: &SubservicesStatus) -> String {
+pub fn format_subservice_checklist(s: &SubservicesStatus) -> String {
     let ai_mark = if s.ai_bridge { "✅" } else { "❌" };
     let uds_mark = if s.uds_socket { "✅" } else { "❌" };
     let ssh_mark = if s.sshd { "✅" } else { "❌" };
@@ -135,12 +142,86 @@ fn format_subservice_checklist(s: &SubservicesStatus) -> String {
     )
 }
 
-fn format_offline_alert(w: &WorkerStatus, reason: &str, healthy: usize, total: usize) -> String {
+pub fn format_fleet_overview(
+    definitions: &[WorkerDefinition],
+    workers: &HashMap<String, WorkerStatus>,
+) -> String {
+    let total = definitions.len();
+    let healthy = definitions
+        .iter()
+        .filter(|d| workers.get(&d.url).map(|w| w.is_healthy).unwrap_or(false))
+        .count();
     let pct = if total > 0 {
         (healthy * 100) / total
     } else {
         0
     };
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "*Cluster Fleet ({} / {} Active - {}%):*",
+        healthy, total, pct
+    ));
+    for def in definitions {
+        if let Some(w) = workers.get(&def.url) {
+            if w.is_healthy {
+                let ver = w
+                    .version
+                    .as_deref()
+                    .map(|v| {
+                        if v.starts_with('v') {
+                            v.to_string()
+                        } else {
+                            format!("v{}", v)
+                        }
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                lines.push(format!("• 🟢 {}: Healthy ({})", def.name, ver));
+            } else {
+                match &w.lifecycle {
+                    LifecycleState::DownConfirmed { reason, .. }
+                    | LifecycleState::DownPending { reason, .. } => {
+                        let clean = clean_error_reason(reason);
+                        lines.push(format!("• 🔴 {}: Offline ({})", def.name, clean));
+                    }
+                    LifecycleState::Degraded { .. } | LifecycleState::Recovering { .. } => {
+                        let failed = w.subservices.failed_list().join(", ");
+                        let desc = if failed.is_empty() {
+                            "Subservices initializing".to_string()
+                        } else {
+                            failed
+                        };
+                        lines.push(format!("• 🟡 {}: Degraded ({})", def.name, desc));
+                    }
+                    _ => {
+                        lines.push(format!("• 🔴 {}: Offline", def.name));
+                    }
+                }
+            }
+        } else {
+            lines.push(format!("• ⚪ {}: Unknown", def.name));
+        }
+    }
+    lines.join("\n")
+}
+
+pub fn format_offline_alert(
+    w: &WorkerStatus,
+    reason: &str,
+    healthy: usize,
+    fleet_overview: &str,
+) -> String {
+    let version_str = w
+        .version
+        .as_deref()
+        .map(|v| {
+            if v.starts_with('v') {
+                v.to_string()
+            } else {
+                format!("v{}", v)
+            }
+        })
+        .unwrap_or_else(|| "-".to_string());
     let ssh_info = match w.ssh_port {
         Some(p) => format!("Port {}", p),
         None => "-".to_string(),
@@ -152,39 +233,47 @@ fn format_offline_alert(w: &WorkerStatus, reason: &str, healthy: usize, total: u
             "🚨 *[MUSE-HUB] CRITICAL: Entire Pool Offline!*\n\
             ━━━━━━━━━━━━━━━━━━━━━\n\
             *Last Node:* `{}`\n\
-            *Target:* `{}`\n\
+            *Version:* `{}`\n\
             *SSH:* `{}`\n\
             *Status:* 🔴 OFFLINE ({})\n\
             ━━━━━━━━━━━━━━━━━━━━━\n\
-            *Pool Capacity:* `0/{} Active (0%)`\n\
+            {}\n\
+            ━━━━━━━━━━━━━━━━━━━━━\n\
             ⚠️ *All inference workers are down! AI requests will fail until a node recovers.*\n\
             *Time:* `{}`",
-            w.name, w.url, ssh_info, reason, total, time_str
+            w.name, version_str, ssh_info, reason, fleet_overview, time_str
         )
     } else {
         format!(
             "🔴 *[MUSE-HUB] Worker Offline (Confirmed)*\n\
             ━━━━━━━━━━━━━━━━━━━━━\n\
             *Node:* `{}`\n\
-            *Target:* `{}`\n\
+            *Version:* `{}`\n\
             *SSH:* `{}`\n\
             *Status:* 🔴 OFFLINE\n\
             *Reason:* {}\n\
             ━━━━━━━━━━━━━━━━━━━━━\n\
-            *Pool Capacity:* `{}/{} Active ({}%)`\n\
+            {}\n\
+            ━━━━━━━━━━━━━━━━━━━━━\n\
             *Action:* Auto-failover redirected to another healthy node\n\
             *Time:* `{}`",
-            w.name, w.url, ssh_info, reason, healthy, total, pct, time_str
+            w.name, version_str, ssh_info, reason, fleet_overview, time_str
         )
     }
 }
 
-fn format_online_alert(w: &WorkerStatus, healthy: usize, total: usize) -> String {
-    let pct = if total > 0 {
-        (healthy * 100) / total
-    } else {
-        0
-    };
+pub fn format_online_alert(w: &WorkerStatus, fleet_overview: &str) -> String {
+    let version_str = w
+        .version
+        .as_deref()
+        .map(|v| {
+            if v.starts_with('v') {
+                v.to_string()
+            } else {
+                format!("v{}", v)
+            }
+        })
+        .unwrap_or_else(|| "-".to_string());
     let ssh_info = match w.ssh_port {
         Some(p) => format!("Port {}", p),
         None => "-".to_string(),
@@ -196,30 +285,32 @@ fn format_online_alert(w: &WorkerStatus, healthy: usize, total: usize) -> String
         "🟢 *[MUSE-HUB] Worker Fully Online & Healthy*\n\
         ━━━━━━━━━━━━━━━━━━━━━\n\
         *Node:* `{}`\n\
-        *Target:* `{}`\n\
+        *Version:* `{}`\n\
         *SSH:* `{}`\n\
         *Status:* 🟢 HEALTHY (100% Subservices Ready)\n\
         ━━━━━━━━━━━━━━━━━━━━━\n\
         *Subservices Status:*\n\
         {}\n\
         ━━━━━━━━━━━━━━━━━━━━━\n\
-        *Pool Capacity:* `{}/{} Active ({}%)`\n\
+        {}\n\
+        ━━━━━━━━━━━━━━━━━━━━━\n\
         *Time:* `{}`",
-        w.name, w.url, ssh_info, checklist, healthy, total, pct, time_str
+        w.name, version_str, ssh_info, checklist, fleet_overview, time_str
     )
 }
 
-fn format_degraded_alert(
-    w: &WorkerStatus,
-    healthy: usize,
-    total: usize,
-    elapsed_secs: u64,
-) -> String {
-    let pct = if total > 0 {
-        (healthy * 100) / total
-    } else {
-        0
-    };
+pub fn format_degraded_alert(w: &WorkerStatus, fleet_overview: &str, elapsed_secs: u64) -> String {
+    let version_str = w
+        .version
+        .as_deref()
+        .map(|v| {
+            if v.starts_with('v') {
+                v.to_string()
+            } else {
+                format!("v{}", v)
+            }
+        })
+        .unwrap_or_else(|| "-".to_string());
     let ssh_info = match w.ssh_port {
         Some(p) => format!("Port {}", p),
         None => "-".to_string(),
@@ -232,7 +323,7 @@ fn format_degraded_alert(
         "🟡 *[MUSE-HUB] Worker Degraded (Grace Window Timeout)*\n\
         ━━━━━━━━━━━━━━━━━━━━━\n\
         *Node:* `{}`\n\
-        *Target:* `{}`\n\
+        *Version:* `{}`\n\
         *SSH:* `{}`\n\
         *Status:* 🟡 DEGRADED (Grace window exceeded: {}s)\n\
         *Failing Subservices:* `{}`\n\
@@ -240,23 +331,29 @@ fn format_degraded_alert(
         *Subservices Status:*\n\
         {}\n\
         ━━━━━━━━━━━━━━━━━━━━━\n\
-        *Pool Capacity:* `{}/{} Active ({}%)`\n\
+        {}\n\
+        ━━━━━━━━━━━━━━━━━━━━━\n\
         *Time:* `{}`",
-        w.name, w.url, ssh_info, elapsed_secs, failed, checklist, healthy, total, pct, time_str
+        w.name, version_str, ssh_info, elapsed_secs, failed, checklist, fleet_overview, time_str
     )
 }
 
-fn format_http_degraded_alert(
+pub fn format_http_degraded_alert(
     w: &WorkerStatus,
     status_code: u16,
-    healthy: usize,
-    total: usize,
+    fleet_overview: &str,
 ) -> String {
-    let pct = if total > 0 {
-        (healthy * 100) / total
-    } else {
-        0
-    };
+    let version_str = w
+        .version
+        .as_deref()
+        .map(|v| {
+            if v.starts_with('v') {
+                v.to_string()
+            } else {
+                format!("v{}", v)
+            }
+        })
+        .unwrap_or_else(|| "-".to_string());
     let ssh_info = match w.ssh_port {
         Some(p) => format!("Port {}", p),
         None => "-".to_string(),
@@ -267,15 +364,91 @@ fn format_http_degraded_alert(
         "🔴 *[MUSE-HUB] Worker HTTP Error*\n\
         ━━━━━━━━━━━━━━━━━━━━━\n\
         *Node:* `{}`\n\
-        *Target:* `{}`\n\
+        *Version:* `{}`\n\
         *SSH:* `{}`\n\
         *Status:* 🔴 OFFLINE (HTTP {})\n\
         *Reason:* Internal endpoint returned error code\n\
         ━━━━━━━━━━━━━━━━━━━━━\n\
-        *Pool Capacity:* `{}/{} Active ({}%)`\n\
+        {}\n\
+        ━━━━━━━━━━━━━━━━━━━━━\n\
         *Action:* Auto-failover redirected to another healthy node\n\
         *Time:* `{}`",
-        w.name, w.url, ssh_info, status_code, healthy, total, pct, time_str
+        w.name, version_str, ssh_info, status_code, fleet_overview, time_str
+    )
+}
+
+pub fn format_upgrade_success_alert(
+    w: &WorkerStatus,
+    old_ver: &str,
+    new_ver: &str,
+    fleet_overview: &str,
+) -> String {
+    let old_formatted = if old_ver.starts_with('v') {
+        old_ver.to_string()
+    } else {
+        format!("v{}", old_ver)
+    };
+    let new_formatted = if new_ver.starts_with('v') {
+        new_ver.to_string()
+    } else {
+        format!("v{}", new_ver)
+    };
+    let ssh_info = match w.ssh_port {
+        Some(p) => format!("Port {}", p),
+        None => "-".to_string(),
+    };
+    let time_str = Local::now().format("%Y-%m-%d %H:%M:%S");
+
+    format!(
+        "🚀 *[MUSE-HUB] Worker Auto-Update Successful*\n\
+        ━━━━━━━━━━━━━━━━━━━━━\n\
+        *Node:* `{}`\n\
+        *Version:* `{}` ➔ `{}`\n\
+        *SSH:* `{}`\n\
+        *Status:* 🟢 UPGRADED & HEALTHY\n\
+        ━━━━━━━━━━━━━━━━━━━━━\n\
+        {}\n\
+        ━━━━━━━━━━━━━━━━━━━━━\n\
+        *Time:* `{}`",
+        w.name, old_formatted, new_formatted, ssh_info, fleet_overview, time_str
+    )
+}
+
+pub fn format_upgrade_failed_alert(
+    w: &WorkerStatus,
+    error_reason: &str,
+    fleet_overview: &str,
+) -> String {
+    let version_str = w
+        .version
+        .as_deref()
+        .map(|v| {
+            if v.starts_with('v') {
+                v.to_string()
+            } else {
+                format!("v{}", v)
+            }
+        })
+        .unwrap_or_else(|| "-".to_string());
+    let ssh_info = match w.ssh_port {
+        Some(p) => format!("Port {}", p),
+        None => "-".to_string(),
+    };
+    let time_str = Local::now().format("%Y-%m-%d %H:%M:%S");
+
+    format!(
+        "⚠️ *[MUSE-HUB] Worker Auto-Update Failed*\n\
+        ━━━━━━━━━━━━━━━━━━━━━\n\
+        *Node:* `{}`\n\
+        *Current Version:* `{}`\n\
+        *SSH:* `{}`\n\
+        *Status:* ⚠️ UPDATE FAILED\n\
+        *Error:* {}\n\
+        ━━━━━━━━━━━━━━━━━━━━━\n\
+        {}\n\
+        ━━━━━━━━━━━━━��━━━━━━━\n\
+        *Time:* `{}`",
+        w.name, version_str, ssh_info, error_reason, fleet_overview, time_str
     )
 }
 
@@ -297,6 +470,10 @@ impl WorkerPool {
                     active_requests: Arc::new(AtomicUsize::new(0)),
                     lifecycle: LifecycleState::Healthy,
                     subservices: SubservicesStatus::default(),
+                    version: None,
+                    role: None,
+                    last_update_error: None,
+                    reported_update_error: None,
                 },
             );
         }
@@ -409,14 +586,15 @@ impl WorkerPool {
             let res = self.client.get(&health_url).send().await;
 
             enum AlertAction {
-                None,
-                SendOnline(WorkerStatus),
-                SendDegraded(WorkerStatus, u64),
-                SendOffline(WorkerStatus, String),
-                SendHttpDegraded(WorkerStatus, u16),
+                Online(WorkerStatus),
+                Degraded(WorkerStatus, u64),
+                Offline(WorkerStatus, String),
+                HttpDegraded(WorkerStatus, u16),
+                UpgradeSuccess(WorkerStatus, String, String),
+                UpgradeFailed(WorkerStatus, String),
             }
 
-            let mut alert_action = AlertAction::None;
+            let mut alert_actions = Vec::new();
             let mut hook_to_trigger: Option<(String, String)> = None;
 
             {
@@ -457,6 +635,54 @@ impl WorkerPool {
                                         }
                                     };
 
+                                let new_version = parsed_val
+                                    .get("version")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                let role = parsed_val
+                                    .get("role")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                let update_error = parsed_val
+                                    .get("update_error")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty());
+
+                                if let Some(r) = role {
+                                    w.role = Some(r);
+                                }
+
+                                // Check for auto-update version bump
+                                let mut upgraded = false;
+                                if let Some(ref current_new_ver) = new_version {
+                                    if let Some(ref old_ver) = w.version {
+                                        if old_ver != current_new_ver {
+                                            upgraded = true;
+                                            alert_actions.push(AlertAction::UpgradeSuccess(
+                                                w.clone(),
+                                                old_ver.clone(),
+                                                current_new_ver.clone(),
+                                            ));
+                                        }
+                                    }
+                                    w.version = Some(current_new_ver.clone());
+                                }
+
+                                // Check for auto-update error notifications (debounced)
+                                if let Some(ref err) = update_error {
+                                    if w.reported_update_error.as_deref() != Some(err) {
+                                        w.reported_update_error = Some(err.clone());
+                                        alert_actions.push(AlertAction::UpgradeFailed(
+                                            w.clone(),
+                                            err.clone(),
+                                        ));
+                                    }
+                                } else {
+                                    w.reported_update_error = None;
+                                }
+                                w.last_update_error = update_error;
+
                                 w.subservices = subservices.clone();
                                 w.consecutive_failures = 0;
                                 // If AI bridge & UDS are ready, node can serve AI inference requests
@@ -470,7 +696,9 @@ impl WorkerPool {
                                         if all_ready {
                                             // Immediately mark 100% UP without waiting for grace period
                                             w.lifecycle = LifecycleState::Healthy;
-                                            alert_action = AlertAction::SendOnline(w.clone());
+                                            if !upgraded {
+                                                alert_actions.push(AlertAction::Online(w.clone()));
+                                            }
                                         } else {
                                             // Subservices still pending (e.g. UDS/SSH/Sync), start grace window timer
                                             w.lifecycle = LifecycleState::Recovering {
@@ -488,7 +716,9 @@ impl WorkerPool {
                                         if all_ready {
                                             // All subservices ready before grace window expired -> send UP immediately!
                                             w.lifecycle = LifecycleState::Healthy;
-                                            alert_action = AlertAction::SendOnline(w.clone());
+                                            if !upgraded {
+                                                alert_actions.push(AlertAction::Online(w.clone()));
+                                            }
                                         } else if elapsed >= MAX_GRACE_WINDOW_SECS {
                                             // Grace window expired and subservices still failing -> send DEGRADED alert
                                             w.lifecycle = LifecycleState::Degraded {
@@ -496,8 +726,8 @@ impl WorkerPool {
                                                 last_details: subservices,
                                                 alert_sent: true,
                                             };
-                                            alert_action =
-                                                AlertAction::SendDegraded(w.clone(), elapsed);
+                                            alert_actions
+                                                .push(AlertAction::Degraded(w.clone(), elapsed));
                                         } else {
                                             // Still within grace window, update last_details
                                             w.lifecycle = LifecycleState::Recovering {
@@ -513,7 +743,9 @@ impl WorkerPool {
                                     } => {
                                         if all_ready {
                                             w.lifecycle = LifecycleState::Healthy;
-                                            alert_action = AlertAction::SendOnline(w.clone());
+                                            if !upgraded {
+                                                alert_actions.push(AlertAction::Online(w.clone()));
+                                            }
                                         } else {
                                             w.lifecycle = LifecycleState::Degraded {
                                                 first_detected: *first_detected,
@@ -550,10 +782,10 @@ impl WorkerPool {
                                                 since: *first_detected_down,
                                                 reason: format!("HTTP Status {}", status_code),
                                             };
-                                            alert_action = AlertAction::SendHttpDegraded(
+                                            alert_actions.push(AlertAction::HttpDegraded(
                                                 w.clone(),
                                                 status_code,
-                                            );
+                                            ));
                                             if let Some(hook) = &w.on_offline_hook {
                                                 hook_to_trigger =
                                                     Some((w.name.clone(), hook.clone()));
@@ -587,7 +819,8 @@ impl WorkerPool {
                                             since: *first_detected_down,
                                             reason: err_str.clone(),
                                         };
-                                        alert_action = AlertAction::SendOffline(w.clone(), err_str);
+                                        alert_actions
+                                            .push(AlertAction::Offline(w.clone(), err_str));
                                         if let Some(hook) = &w.on_offline_hook {
                                             hook_to_trigger = Some((w.name.clone(), hook.clone()));
                                         }
@@ -634,63 +867,70 @@ impl WorkerPool {
                 });
             }
 
-            // Send Telegram notification based on verified action
-            let notif_to_send = {
+            // Send Telegram notifications based on verified actions
+            if !alert_actions.is_empty() {
                 let workers = self.workers.read().await;
+                let fleet_overview = format_fleet_overview(&self.definitions, &workers);
                 let healthy_count = workers.values().filter(|w| w.is_healthy).count();
-                let total_count = workers.len();
 
-                match alert_action {
-                    AlertAction::None => None,
-                    AlertAction::SendOnline(w_info) => {
-                        info!(
-                            "Worker {} ({}) recovered and 100% subservices are HEALTHY",
-                            w_info.name, target
-                        );
-                        Some(format_online_alert(&w_info, healthy_count, total_count))
-                    }
-                    AlertAction::SendDegraded(w_info, elapsed) => {
-                        warn!(
-                            "Worker {} ({}) grace window expired ({}s). Sending DEGRADED alert.",
-                            w_info.name, target, elapsed
-                        );
-                        Some(format_degraded_alert(
-                            &w_info,
-                            healthy_count,
-                            total_count,
-                            elapsed,
-                        ))
-                    }
-                    AlertAction::SendOffline(w_info, err_str) => {
-                        warn!(
-                            "Worker {} ({}) confirmed DOWN (failure: {}). Sending OFFLINE alert.",
-                            w_info.name, target, err_str
-                        );
-                        let clean_reason = clean_error_reason(&err_str);
-                        Some(format_offline_alert(
-                            &w_info,
-                            &clean_reason,
-                            healthy_count,
-                            total_count,
-                        ))
-                    }
-                    AlertAction::SendHttpDegraded(w_info, code) => {
-                        warn!(
-                            "Worker {} ({}) confirmed HTTP {} error. Sending HTTP DEGRADED alert.",
-                            w_info.name, target, code
-                        );
-                        Some(format_http_degraded_alert(
-                            &w_info,
-                            code,
-                            healthy_count,
-                            total_count,
-                        ))
-                    }
+                for action in alert_actions {
+                    let text = match action {
+                        AlertAction::Online(w_info) => {
+                            info!(
+                                "Worker {} ({}) recovered and 100% subservices are HEALTHY",
+                                w_info.name, target
+                            );
+                            format_online_alert(&w_info, &fleet_overview)
+                        }
+                        AlertAction::Degraded(w_info, elapsed) => {
+                            warn!(
+                                "Worker {} ({}) grace window expired ({}s). Sending DEGRADED alert.",
+                                w_info.name, target, elapsed
+                            );
+                            format_degraded_alert(&w_info, &fleet_overview, elapsed)
+                        }
+                        AlertAction::Offline(w_info, err_str) => {
+                            warn!(
+                                "Worker {} ({}) confirmed DOWN (failure: {}). Sending OFFLINE alert.",
+                                w_info.name, target, err_str
+                            );
+                            let clean_reason = clean_error_reason(&err_str);
+                            format_offline_alert(
+                                &w_info,
+                                &clean_reason,
+                                healthy_count,
+                                &fleet_overview,
+                            )
+                        }
+                        AlertAction::HttpDegraded(w_info, code) => {
+                            warn!(
+                                "Worker {} ({}) confirmed HTTP {} error. Sending HTTP DEGRADED alert.",
+                                w_info.name, target, code
+                            );
+                            format_http_degraded_alert(&w_info, code, &fleet_overview)
+                        }
+                        AlertAction::UpgradeSuccess(w_info, old_ver, new_ver) => {
+                            info!(
+                                "Worker {} ({}) auto-upgraded from {} to {}",
+                                w_info.name, target, old_ver, new_ver
+                            );
+                            format_upgrade_success_alert(
+                                &w_info,
+                                &old_ver,
+                                &new_ver,
+                                &fleet_overview,
+                            )
+                        }
+                        AlertAction::UpgradeFailed(w_info, err_str) => {
+                            warn!(
+                                "Worker {} ({}) auto-update failed: {}",
+                                w_info.name, target, err_str
+                            );
+                            format_upgrade_failed_alert(&w_info, &err_str, &fleet_overview)
+                        }
+                    };
+                    self.telegram.send_alert(&text).await;
                 }
-            };
-
-            if let Some(text) = notif_to_send {
-                self.telegram.send_alert(&text).await;
             }
         }
     }
@@ -709,6 +949,9 @@ impl WorkerPool {
                 last_checked_secs_ago: w.last_checked.elapsed().as_secs(),
                 active_requests: w.active_requests.load(Ordering::Relaxed),
                 subservices: w.subservices.clone(),
+                version: w.version.clone(),
+                role: w.role.clone(),
+                last_update_error: w.last_update_error.clone(),
             })
             .collect()
     }
