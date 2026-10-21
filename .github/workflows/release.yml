@@ -32,15 +32,25 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
 
-      - name: Determine version
+      - name: Determine & validate version
         id: get_version
         run: |
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)
+          echo "Cargo.toml workspace version is: ${CARGO_VERSION}"
+
           if [ -n "${{ github.event.inputs.tag_name }}" ]; then
             TAG="${{ github.event.inputs.tag_name }}"
           else
             TAG="${GITHUB_REF#refs/tags/}"
           fi
+
           VERSION="${TAG#v}"
+          if [ "${VERSION}" != "${CARGO_VERSION}" ]; then
+            echo "ERROR: Git tag version (${VERSION}) does not match Cargo.toml version (${CARGO_VERSION})!"
+            echo "Please update [workspace.package] version in Cargo.toml to match ${VERSION} before releasing."
+            exit 1
+          fi
+
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "${VERSION}" > version.txt
