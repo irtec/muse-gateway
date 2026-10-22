@@ -20,7 +20,6 @@ async fn test_health_check_degraded_returns_503() {
     let supervisor = Arc::new(ProcessSupervisor::new(
         config.supervisor.clone(),
         config.vm.id.clone(),
-        None,
     ));
 
     let state = AppState {

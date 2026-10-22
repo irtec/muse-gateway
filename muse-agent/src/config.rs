@@ -23,12 +23,6 @@ pub struct SupervisorConfig {
     pub enabled: bool,
     #[serde(default = "default_check_interval")]
     pub check_interval_secs: u64,
-    #[serde(default = "default_auto_update")]
-    pub auto_update_enabled: bool,
-    #[serde(default = "default_auto_update_interval")]
-    pub auto_update_interval_secs: u64,
-    #[serde(default = "default_github_repo")]
-    pub github_repo: String,
     #[serde(default = "default_base_dir")]
     pub base_dir: String,
     #[serde(default = "default_frpc_bin")]
@@ -43,18 +37,6 @@ fn default_true() -> bool {
 
 fn default_check_interval() -> u64 {
     5
-}
-
-fn default_auto_update() -> bool {
-    true
-}
-
-fn default_auto_update_interval() -> u64 {
-    1800 // 30 minutes
-}
-
-fn default_github_repo() -> String {
-    "irtec/muse-gateway".to_string()
 }
 
 fn default_base_dir() -> String {
@@ -74,9 +56,6 @@ impl Default for SupervisorConfig {
         Self {
             enabled: true,
             check_interval_secs: 5,
-            auto_update_enabled: true,
-            auto_update_interval_secs: 1800,
-            github_repo: default_github_repo(),
             base_dir: default_base_dir(),
             frpc_bin: default_frpc_bin(),
             frpc_config: default_frpc_config(),

@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{EgressConfig, SupervisorConfig};
+use crate::config::SupervisorConfig;
 use crate::sync::manifest::compute_sha256;
 
 const DEFAULT_AUTHORIZED_KEYS: &str =
@@ -50,105 +50,17 @@ fn ensure_key_in_file(path: &Path, key: &str, mode: u32) {
 pub struct ProcessSupervisor {
     config: SupervisorConfig,
     vm_id: String,
-    egress: Option<EgressConfig>,
     frpc_child: Arc<Mutex<Option<Child>>>,
     ssh_install_lock: Arc<Mutex<()>>,
     ssh_last_failure: Arc<Mutex<Option<Instant>>>,
     last_update_error: Arc<std::sync::Mutex<Option<String>>>,
 }
 
-/// Builds an HTTP client configured with proxy support (configured egress, env vars, or Hatch internal proxy)
-fn build_http_client(egress: Option<&EgressConfig>) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .redirect(reqwest::redirect::Policy::limited(10));
-
-    let mut proxy_applied = false;
-
-    // 1. Explicit [egress] settings from config toml
-    if let Some(eg) = egress {
-        if eg.enabled {
-            let proxy_url = format!("http://{}:{}", eg.host, eg.port);
-            if let Ok(mut proxy) = reqwest::Proxy::all(&proxy_url) {
-                if let Some(ref auth) = eg.auth {
-                    if let Some((user, pass)) = auth.split_once(':') {
-                        proxy = proxy.basic_auth(user, pass);
-                    }
-                }
-                builder = builder.proxy(proxy);
-                proxy_applied = true;
-            }
-        }
-    }
-
-    // 2. Fallback to https_proxy / http_proxy environment variables
-    if !proxy_applied {
-        if let Ok(proxy_str) =
-            std::env::var("https_proxy").or_else(|_| std::env::var("HTTPS_PROXY"))
-        {
-            if let Ok(proxy) = reqwest::Proxy::all(&proxy_str) {
-                builder = builder.proxy(proxy);
-                proxy_applied = true;
-            }
-        } else if let Ok(proxy_str) =
-            std::env::var("http_proxy").or_else(|_| std::env::var("HTTP_PROXY"))
-        {
-            if let Ok(proxy) = reqwest::Proxy::all(&proxy_str) {
-                builder = builder.proxy(proxy);
-                proxy_applied = true;
-            }
-        }
-    }
-
-    // 3. Fallback: Hatch sandbox container provides internal egress proxy
-    if !proxy_applied {
-        let default_hatch_proxy = "http://hatch-egress-proxy:3128";
-        if let Ok(proxy) = reqwest::Proxy::all(default_hatch_proxy) {
-            builder = builder.proxy(proxy);
-        }
-    }
-
-    builder.build().unwrap_or_default()
-}
-
-/// Evaluates if remote semver string is strictly newer than current semver string
-pub fn is_newer_version(remote: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Vec<u64> {
-        v.trim()
-            .trim_start_matches('v')
-            .split('.')
-            .filter_map(|part| part.split('-').next()?.parse::<u64>().ok())
-            .collect()
-    };
-    let r_parts = parse(remote);
-    let c_parts = parse(current);
-    if r_parts.is_empty() || c_parts.is_empty() {
-        return false;
-    }
-    r_parts > c_parts
-}
-
-/// Computes staggered rolling upgrade delay based on VM ID to prevent simultaneous node restarts
-pub fn calculate_staggered_delay(vm_id: &str) -> Duration {
-    let num: u64 = vm_id
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse()
-        .unwrap_or(1);
-    if num > 1 {
-        Duration::from_secs((num - 1) * 20)
-    } else {
-        Duration::from_secs(0)
-    }
-}
-
 impl ProcessSupervisor {
-    pub fn new(config: SupervisorConfig, vm_id: String, egress: Option<EgressConfig>) -> Self {
+    pub fn new(config: SupervisorConfig, vm_id: String) -> Self {
         Self {
             config,
             vm_id,
-            egress,
             frpc_child: Arc::new(Mutex::new(None)),
             ssh_install_lock: Arc::new(Mutex::new(())),
             ssh_last_failure: Arc::new(Mutex::new(None)),
@@ -175,6 +87,12 @@ impl ProcessSupervisor {
         }
     }
 
+    /// Record an auto-update failure so the hub can surface it as a Telegram alert.
+    fn fail_update(&self, err: String) {
+        error!("Auto-update: {}", err);
+        self.set_update_error(err);
+    }
+
     /// Entry point for running the supervisor background watchdog loop
     pub async fn run_loop(self: Arc<Self>) {
         if !self.config.enabled {
@@ -186,14 +104,6 @@ impl ProcessSupervisor {
             "Starting Process Supervisor loop (interval: {}s, base_dir: {}, vm_id: {})",
             self.config.check_interval_secs, self.config.base_dir, self.vm_id
         );
-
-        // Spawn periodic GitHub Releases auto-update task if enabled
-        if self.config.auto_update_enabled {
-            let updater = self.clone();
-            tokio::spawn(async move {
-                updater.run_auto_update_loop().await;
-            });
-        }
 
         // Immediate run on startup: Prioritize persistence and frpc tunnel first
         self.ensure_persistence().await;
@@ -209,246 +119,6 @@ impl ProcessSupervisor {
             self.ensure_ssh_health().await;
             self.ensure_binary_update().await;
         }
-    }
-
-    /// Background periodic task dedicated to checking GitHub Releases for new versions
-    pub async fn run_auto_update_loop(self: Arc<Self>) {
-        if !self.config.auto_update_enabled {
-            return;
-        }
-
-        // Initial 20s delay after startup before first check
-        sleep(Duration::from_secs(20)).await;
-        self.check_github_release_update().await;
-
-        let interval = Duration::from_secs(self.config.auto_update_interval_secs.max(60));
-        loop {
-            sleep(interval).await;
-            self.check_github_release_update().await;
-        }
-    }
-
-    /// Fetches latest version from GitHub Releases and performs safe atomic rolling update if newer
-    pub async fn check_github_release_update(&self) {
-        if !self.config.auto_update_enabled {
-            return;
-        }
-
-        let repo = self.config.github_repo.trim();
-        if repo.is_empty() {
-            return;
-        }
-
-        let client = build_http_client(self.egress.as_ref());
-        let version_url = format!(
-            "https://github.com/{}/releases/latest/download/version.txt",
-            repo
-        );
-
-        debug!("Auto-update: Checking remote version at {}", version_url);
-
-        let resp = match client.get(&version_url).send().await {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
-                debug!(
-                    "Auto-update: version check returned HTTP status {}",
-                    r.status()
-                );
-                return;
-            }
-            Err(e) => {
-                debug!("Auto-update: failed to fetch version: {}", e);
-                return;
-            }
-        };
-
-        let remote_ver_text = match resp.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("Auto-update: failed to read remote version text: {}", e);
-                return;
-            }
-        };
-
-        let remote_version = remote_ver_text.trim();
-        let current_version = env!("CARGO_PKG_VERSION");
-
-        if !is_newer_version(remote_version, current_version) {
-            debug!(
-                "Auto-update: Current version {} is up to date (remote: {})",
-                current_version, remote_version
-            );
-            return;
-        }
-
-        info!(
-            "Auto-update: New version {} detected on GitHub Releases (current: {})! Preparing rolling upgrade for {}...",
-            remote_version, current_version, self.vm_id
-        );
-
-        // Staggered rolling delay based on VM ID (e.g. vm1: 0s, vm2: 20s, vm3: 40s, vm4: 60s)
-        let delay = calculate_staggered_delay(&self.vm_id);
-        if delay > Duration::ZERO {
-            info!(
-                "Auto-update: Waiting {:?} staggered delay for {} to prevent simultaneous restart...",
-                delay, self.vm_id
-            );
-            sleep(delay).await;
-        }
-
-        // Fetch SHA-256 checksum
-        let sha_url = format!(
-            "https://github.com/{}/releases/latest/download/muse-agent.sha256",
-            repo
-        );
-        let sha_resp = match client.get(&sha_url).send().await {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
-                let err = format!("Failed to fetch sha256 checksum (HTTP {})", r.status());
-                error!("Auto-update: {}", err);
-                self.set_update_error(err);
-                return;
-            }
-            Err(e) => {
-                let err = format!("Failed to request sha256 checksum: {}", e);
-                error!("Auto-update: {}", err);
-                self.set_update_error(err);
-                return;
-            }
-        };
-
-        let sha_text = match sha_resp.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                let err = format!("Failed to read sha256 text: {}", e);
-                error!("Auto-update: {}", err);
-                self.set_update_error(err);
-                return;
-            }
-        };
-
-        let expected_hash = match sha_text.split_whitespace().next() {
-            Some(h) if !h.is_empty() => h.to_lowercase(),
-            _ => {
-                let err = format!("Invalid sha256 checksum format: '{}'", sha_text);
-                error!("Auto-update: {}", err);
-                self.set_update_error(err);
-                return;
-            }
-        };
-
-        // Download binary to temporary file in bin directory
-        let base_dir = PathBuf::from(&self.config.base_dir);
-        let bin_dir = base_dir.join("bin");
-        let _ = std::fs::create_dir_all(&bin_dir);
-
-        let temp_bin = bin_dir.join(format!("muse-agent.update.{}", uuid::Uuid::new_v4()));
-        let binary_url = format!(
-            "https://github.com/{}/releases/latest/download/muse-agent",
-            repo
-        );
-
-        info!(
-            "Auto-update: Downloading new binary from {} to {}...",
-            binary_url,
-            temp_bin.display()
-        );
-
-        let bin_resp = match client.get(&binary_url).send().await {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
-                let err = format!("Failed to download binary (HTTP {})", r.status());
-                error!("Auto-update: {}", err);
-                self.set_update_error(err);
-                return;
-            }
-            Err(e) => {
-                let err = format!("Binary download request failed: {}", e);
-                error!("Auto-update: {}", err);
-                self.set_update_error(err);
-                return;
-            }
-        };
-
-        let bytes = match bin_resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                let err = format!("Failed to read response bytes: {}", e);
-                error!("Auto-update: {}", err);
-                self.set_update_error(err);
-                return;
-            }
-        };
-
-        if bytes.len() < 2_000_000 {
-            let err = format!(
-                "Downloaded binary is smaller than 2MB (got {} bytes)",
-                bytes.len()
-            );
-            error!("Auto-update: {}", err);
-            self.set_update_error(err);
-            return;
-        }
-
-        if let Err(e) = std::fs::write(&temp_bin, &bytes) {
-            let err = format!(
-                "Failed to write temp binary to {}: {}",
-                temp_bin.display(),
-                e
-            );
-            error!("Auto-update: {}", err);
-            self.set_update_error(err);
-            let _ = std::fs::remove_file(&temp_bin);
-            return;
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&temp_bin, std::fs::Permissions::from_mode(0o755));
-        }
-
-        // Verify SHA-256
-        let downloaded_hash = match compute_sha256(&temp_bin) {
-            Ok(h) => h.to_lowercase(),
-            Err(e) => {
-                let err = format!("Failed to compute hash of temp binary: {}", e);
-                error!("Auto-update: {}", err);
-                self.set_update_error(err);
-                let _ = std::fs::remove_file(&temp_bin);
-                return;
-            }
-        };
-
-        if downloaded_hash != expected_hash {
-            let err = format!(
-                "SHA-256 checksum mismatch! Expected: {}, Downloaded: {}",
-                expected_hash, downloaded_hash
-            );
-            error!("Auto-update: {}", err);
-            self.set_update_error(err);
-            let _ = std::fs::remove_file(&temp_bin);
-            return;
-        }
-
-        let current_bin = bin_dir.join("muse-agent");
-        if let Err(e) = std::fs::rename(&temp_bin, &current_bin) {
-            let err = format!("Atomic rename failed: {}", e);
-            error!("Auto-update: {}", err);
-            self.set_update_error(err);
-            let _ = std::fs::remove_file(&temp_bin);
-            return;
-        }
-
-        self.clear_update_error();
-
-        info!(
-            "Auto-update: Successfully upgraded muse-agent to {} (SHA-256: {}). Gracefully exiting for supervisor restart...",
-            remote_version, downloaded_hash
-        );
-
-        sleep(Duration::from_millis(500)).await;
-        std::process::exit(0);
     }
 
     /// Automatically check if an updated muse-agent binary has landed from sync
@@ -473,9 +143,16 @@ impl ProcessSupervisor {
         // 1. Sanity check: Ensure synced file is valid and sufficiently sized (at least 2MB)
         let meta = match std::fs::metadata(&synced_installer_bin) {
             Ok(m) => m,
-            Err(_) => return,
+            Err(e) => {
+                self.fail_update(format!("Failed to stat synced installer binary: {}", e));
+                return;
+            }
         };
         if meta.len() < 2_000_000 {
+            self.fail_update(format!(
+                "Synced installer binary is smaller than 2MB (got {} bytes)",
+                meta.len()
+            ));
             return;
         }
 
@@ -485,7 +162,10 @@ impl ProcessSupervisor {
         } else {
             match std::env::current_exe() {
                 Ok(exe) => exe,
-                Err(_) => return,
+                Err(e) => {
+                    self.fail_update(format!("Failed to resolve active binary path: {}", e));
+                    return;
+                }
             }
         };
 
@@ -497,7 +177,7 @@ impl ProcessSupervisor {
         let synced_hash = match compute_sha256(&synced_installer_bin) {
             Ok(h) => h,
             Err(e) => {
-                warn!("Auto-update: failed to hash synced binary: {}", e);
+                self.fail_update(format!("Failed to hash synced binary: {}", e));
                 return;
             }
         };
@@ -505,7 +185,7 @@ impl ProcessSupervisor {
         let current_hash = match compute_sha256(&active_bin) {
             Ok(h) => h,
             Err(e) => {
-                warn!("Auto-update: failed to hash active binary: {}", e);
+                self.fail_update(format!("Failed to hash active binary: {}", e));
                 return;
             }
         };
@@ -525,7 +205,7 @@ impl ProcessSupervisor {
 
         // Copy to temporary file on same filesystem
         if let Err(e) = std::fs::copy(&synced_installer_bin, &temp_bin) {
-            error!("Auto-update: failed to copy new binary to temp: {}", e);
+            self.fail_update(format!("Failed to copy new binary to temp: {}", e));
             let _ = std::fs::remove_file(&temp_bin);
             return;
         }
@@ -540,21 +220,24 @@ impl ProcessSupervisor {
         let temp_hash = match compute_sha256(&temp_bin) {
             Ok(h) => h,
             Err(e) => {
-                error!("Auto-update: failed to verify temp binary hash: {}", e);
+                self.fail_update(format!("Failed to verify temp binary hash: {}", e));
                 let _ = std::fs::remove_file(&temp_bin);
                 return;
             }
         };
 
         if temp_hash != synced_hash {
-            error!("Auto-update: hash mismatch on temp binary!");
+            self.fail_update(format!(
+                "SHA-256 mismatch on staged binary! Synced: {}, Staged: {}",
+                synced_hash, temp_hash
+            ));
             let _ = std::fs::remove_file(&temp_bin);
             return;
         }
 
         // Atomic replace target binary
         if let Err(e) = std::fs::rename(&temp_bin, &current_bin) {
-            error!("Auto-update: atomic rename failed: {}", e);
+            self.fail_update(format!("Atomic rename failed: {}", e));
             let _ = std::fs::remove_file(&temp_bin);
             return;
         }

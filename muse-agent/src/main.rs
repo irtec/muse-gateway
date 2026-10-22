@@ -64,7 +64,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let supervisor = Arc::new(ProcessSupervisor::new(
         config.supervisor.clone(),
         config.vm.id.clone(),
-        config.egress.clone(),
     ));
     let supervisor_clone = supervisor.clone();
     tokio::spawn(async move {
