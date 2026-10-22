@@ -33,32 +33,7 @@ Deploying this gateway and worker stack likely violates the Terms of Service (To
 
 ## Architecture Overview
 
-```text
-[ Client / NeuCode / Claude Code ]
-               │
-               ▼ (HTTPS)
-   https://api.yourdomain.com/v1/...
-               │
-               ▼
-┌────────────────────────────────────────────────────────┐
-│             Edge Gateway Hub (muse-hub)                │
-│     • Dynamic Worker Pool & Health Checker             │
-│     • Transparent Zero-502 Failover                    │
-│     • Centralized Telegram Ops Alerting                │
-│     • FRP Server (frps :7000)                          │
-└───────┬───────────────────────┬────────────────────────┘
-        │ (frpc Reverse Tunnel) │
-        ▼                       ▼
-┌───────────────────────┐ ┌───────────────────────┐
-│   Worker 1 (Master)   │ │   Worker 2 (Replica)  │
-│      muse-agent       │ │      muse-agent       │
-│  • AI Bridge (:11436) │ │  • AI Bridge (:11436) │
-│  • File Server (:8080)│ │  • Native Sync Engine │
-│  • frpc Supervisor    │ │  • frpc Supervisor    │
-│  • SSH Self-Healing   │ │  • SSH Self-Healing   │
-│  • UDS Space Engine   │ │  • UDS Auto-Update    │
-└───────────────────────┘ └───────────────────────┘
-```
+![Architecture topology](docs/diagrams/architecture.png)
 
 ---
 
@@ -146,13 +121,4 @@ To maintain a secure and consistent cluster, certain configuration values **must
   ```
   **Critical:** Copy the exact same `auth_salt` and `auth_hash` values to `[file_manager]` in `muse-agent.toml` on **all worker VMs** (VM-01, VM-02, VM-03, etc.). Because the hub provides transparent Active-Standby failover between workers, having identical credentials guarantees that user logins, downloads, and automation scripts continue without session authentication errors during failover.
 
----
 
-## Technical Documentation
-
-For in-depth operational guides, configuration references, and wire protocol details:
-- **Architecture & Operational Workflow:** [`WORKFLOW_ARCHITECTURE.md`](./docs/WORKFLOW_ARCHITECTURE.md)
-- **Hub Gateway Guide:** [`muse-hub/README.md`](./muse-hub/README.md)
-- **Agent Worker Guide:** [`muse-agent/README.md`](./muse-agent/README.md)
-- **Core Library Guide:** [`muse-core/README.md`](./muse-core/README.md)
-- **New Worker Node Bootstrap Guide:** [`deploy/vm-bootstrap/INSTALLER_README.md`](./deploy/vm-bootstrap/INSTALLER_README.md)

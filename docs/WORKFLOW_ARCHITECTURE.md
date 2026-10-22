@@ -18,40 +18,7 @@ The infrastructure is built upon a **Centralized Hub-and-Spoke Gateway** topolog
   - Runs `frpc`, binding local port 11436 (AI) to Edge port 18081, and local port 22 (SSH) to Edge port 2221.
   - Fully contained within the persistent BTRFS directory `/home/hatch/workspace/agent/` to withstand container rebuild cycles.
 
-```text
-[ Client / NeuCode / Claude Code ]
-               │
-               ▼ (HTTPS)
-   https://api.yourdomain.com/v1/chat/completions
-               │
-               ▼
-┌────────────────────────────────────────────────────────┐
-│             Edge Gateway (YOUR_EDGE_IP)                │
-│                                                        │
-│   [ Nginx Reverse Proxy / SSL: api.yourdomain.com ]    │
-│                          │                             │
-│                          ▼ (127.0.0.1:18080)           │
-│   [ muse-hub (Native Rust Gateway) ]                   │
-│     • Dynamic Worker Pool Registry & Health Checker    │
-│     • Transparent Zero-502 Failover                    │
-│     • Single-Source Telegram Notifier                  │
-│                          │                             │
-│       ┌──────────────────┴──────────────────┐          │
-│       ▼ (127.0.0.1:18081)                   ▼          │
-│   [ Reverse Port VM-01 ]            [ Reverse Port VM-02 ]
-│       ▲ (frpc reverse TCP)                  ▲          │
-│   [ frps (Port 7000) ]                      │          │
-└───────┼─────────────────────────────────────┼──────────┘
-        │                                     │
-        ▼ (TCP Direct / Egress Proxy)         ▼
-┌───────────────────────────────┐   ┌───────────────────────────────┐
-│         Muse VM 1             │   │         Muse VM 2             │
-│  /home/hatch/workspace/agent/ │   │  /home/hatch/workspace/agent/ │
-│  • muse-agent (musl binary)   │   │  • muse-agent (musl binary)   │
-│  • frpc tunnel -> Edge :7000  │   │  • frpc tunnel -> Edge :7000  │
-│  • UDS space-inference.sock   │   │  • UDS space-inference.sock   │
-└───────────────────────────────┘   └───────────────────────────────┘
-```
+![Hub-and-spoke topology](diagrams/architecture.png)
 
 ---
 
@@ -334,33 +301,7 @@ Adding extra worker nodes enables zero-downtime failover and load balancing.
 
 The `muse-agent` daemon contains a built-in atomic self-updating engine that enables rolling upgrades across all sandbox worker VMs without manual SSH intervention or cluster downtime. Updates propagate exclusively through the internal **file sync** channel, since sandbox egress to external hosts is blocked.
 
-```
-        Master (VM-01) File Server
- ┌──────────────────────────────────────┐
- │ public/files/muse-agent-installer/   │
- │ - muse-agent (active release binary) │
- │ - install.sh / bootstrap.sh          │
- │ - *.toml.example config templates    │
- └───────────────────┬──────────────────┘
-                     │ (One-Way Delta Sync, 30s interval)
-                     ▼
-       ┌────────────────────────────────────────────────────────┐
-       │ Each Worker (VM-01..04) ProcessSupervisor              │
-       │ 1. Poll synced copy every 5s (check_interval_secs)     │
-       │ 2. Integrity gate: Size >= 2 MB                        │
-       │ 3. Compare SHA-256: synced binary vs active binary     │
-       │ 4. Copy to temp file: muse-agent.update.<uuid>         │
-       │ 5. Re-verify temp SHA-256 matches synced source        │
-       │ 6. Atomic POSIX swap: rename(temp, active_bin)         │
-       │ 7. Log upgrade & graceful exit(0)                      │
-       └──────────────────────────┬─────────────────────────────┘
-                                  │
-                       ┌──────────▼──────────────┐
-                       │ Systemd / run.sh:       │
-                       │ Immediate respawn of    │
-                       │ the new binary version  │
-                       └─────────────────────────┘
-```
+![Fleet-wide rolling auto-update](diagrams/rolling-update.png)
 
 ### Auto-Update Mechanics & Invariants
 

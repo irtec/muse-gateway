@@ -1,0 +1,39 @@
+flowchart LR
+  op["Operator<br/>scp vN → VM-01 master"]
+  pub["update source<br/>public/files/muse-agent-installer/"]
+  sync["VM-02..0N · SyncClient pull<br/>10-30s interval"]
+  gate{"supervisor tick 5s<br/>size ≥ 2 MB · sha256 differs?"}
+  stage["copy → .update.uuid<br/>re-read sha256"]
+  swap["atomic rename → muse-agent<br/>std::process::exit(0)"]
+  respawn["systemd Restart=always<br/>muse-hub sees version delta"]
+  alert(["🚀 Auto-Update OK<br/>🟢 back online"])
+  noop["no-op<br/>next tick"]
+  dead(["⚠️ Upgrade Failed<br/>binary untouched"])
+
+  op --> pub
+  pub -->|replicate| sync
+  sync -->|stat synced file| gate
+  gate -->|new hash| stage
+  gate -->|identical| noop
+  stage -->|match| swap
+  stage -.->|corrupt| dead
+  swap --> respawn
+  respawn --> alert
+
+  classDef opFill fill:#1b2a4a,stroke:#6b8cff,color:#dbe4ff;
+  classDef pageFill fill:#2e2410,stroke:#e0b83a,color:#ffe9b8;
+  classDef syncFill fill:#241a33,stroke:#a98cff,color:#ecdcff;
+  classDef okFill fill:#16281f,stroke:#4bd08a,color:#d3f5e2;
+  classDef hubFill fill:#1b2a4a,stroke:#6b8cff,color:#dbe4ff;
+  classDef alertFill fill:#14291f,stroke:#47c987,color:#d3f5e2;
+  classDef noopFill fill:#26262c,stroke:#8a8f9c,color:#d6d8de;
+  classDef deadFill fill:#331814,stroke:#e05a4a,color:#ffd6d0;
+
+  class op opFill
+  class pub pageFill
+  class sync syncFill
+  class stage,swap okFill
+  class respawn hubFill
+  class alert alertFill
+  class noop noopFill
+  class dead deadFill

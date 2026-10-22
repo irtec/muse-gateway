@@ -1,0 +1,45 @@
+flowchart LR
+  client["Client<br/>NeuCode / Claude Code"]
+
+  subgraph edge["Edge Gateway"]
+    direction TB
+    hub{{"muse-hub<br/>:18080 pool<br/>zero-502"}}
+    fs["file server<br/>router :18090"]
+  end
+
+  tg(["Telegram<br/>ops alerts"])
+
+  subgraph vms["Worker VMs · VM-01..04"]
+    direction TB
+    master["VM-01 · master<br/>muse-agent<br/>bridge 11436 · file mgr 8080"]
+    replica["VM-02..04 · replica<br/>muse-agent<br/>sync + supervisor"]
+    src["installer copy"]
+  end
+
+  client -->|HTTPS| hub
+  hub -->|failover| fs
+  master -->|frps tunnel| fs
+  replica -->|sync pull| fs
+  fs -->|serves| src
+  hub -->|alerts| tg
+
+  classDef edgeFill fill:#2a2418,stroke:#c9a227,color:#f0e6d2;
+  classDef hubFill fill:#1b2a4a,stroke:#6b8cff,color:#dbe4ff;
+  classDef vmFill fill:#16281f,stroke:#4bd08a,color:#d3f5e2;
+  classDef repFill fill:#241a33,stroke:#a98cff,color:#ecdcff;
+  classDef pageFill fill:#2e2410,stroke:#e0b83a,color:#ffe9b8;
+  classDef tgFill fill:#14291f,stroke:#47c987,color:#d3f5e2;
+
+  class edge edgeFill
+  class hub,fs hubFill
+  class master vmFill
+  class replica repFill
+  class src pageFill
+  class tg tgFill
+
+  linkStyle 0 stroke:#6b8cff,stroke-width:2px
+  linkStyle 1 stroke:#e0b83a,stroke-width:2px
+  linkStyle 2 stroke:#4bd08a,stroke-width:2px
+  linkStyle 3 stroke:#a98cff,stroke-width:2px
+  linkStyle 4 stroke:#e0b83a,stroke-width:2px
+  linkStyle 5 stroke:#47c987,stroke-width:2px
