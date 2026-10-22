@@ -6,6 +6,31 @@ This repository contains the backend gateway and worker stack for the **Muse** e
 
 ---
 
+## ⚠️ Disclaimer & Legal Notice
+
+**Read this carefully before deploying.**
+
+This project is an independent, reverse-engineering research effort. It is **not affiliated with, endorsed by, sponsored by, or in any way officially connected to Meta Platforms, Inc.**, or any of its subsidiaries or affiliates. The terms "Muse", "Hatch", "Meta", and associated logos are trademarks or registered trademarks of their respective owners.
+
+### Nature of the Project
+This software interacts with undocumented internal systems, bypasses standard orchestration layers, and utilizes reverse-engineered Unix Domain Socket (UDS) wire protocols of ephemeral sandbox environments.
+
+### Terms of Service (ToS) & Risks
+Deploying this gateway and worker stack likely violates the Terms of Service (ToS) of the underlying platform. By using, modifying, or distributing this software, you acknowledge and agree that:
+
+1. **You Assume All Risks:** You are solely responsible for your use of this software and the infrastructure it runs on.
+2. **No Liability:** The authors, contributors, and publishers of this repository shall not be held liable for any damages, claims, or consequences arising from its use. This includes, but is not limited to:
+   - Immediate suspension or permanent banning of your platform accounts.
+   - Termination, snapshot rollback, or wiping of your sandbox VM instances.
+   - Loss of data, workflows, or API access.
+   - Potential legal action or Cease & Desist notices from the platform provider.
+3. **Cat & Mouse Game:** The underlying platform actively monitors for anomalous traffic and unauthorized IPC access. The wire protocols or VM security postures may change at any time without notice, breaking this integration.
+4. **Educational Purpose:** This repository is published strictly for educational purposes, security research, and technical exploration of distributed systems, Rust async runtimes, and IPC protocols.
+
+**If you do not agree to these terms or cannot accept the risk of account/VM termination, do not use this software.**
+
+---
+
 ## Architecture Overview
 
 ```text
