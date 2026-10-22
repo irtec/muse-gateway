@@ -117,6 +117,8 @@ pub fn clean_error_reason(err: &str) -> String {
         "Network / DNS Resolution Failed".to_string()
     } else if lower.contains("connection reset") {
         "Connection Reset by Peer".to_string()
+    } else if lower.contains("connection closed before message completed") {
+        "Agent Restarting / Tunnel Closed Mid-Request".to_string()
     } else {
         let clean = err.split('(').next().unwrap_or(err).trim();
         if clean.len() > 60 {

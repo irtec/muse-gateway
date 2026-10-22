@@ -130,6 +130,12 @@ fn test_clean_error_reason() {
         clean_error_reason("error sending request for url (http://127.0.0.1:18081/health)"),
         "error sending request for url"
     );
+    assert_eq!(
+        clean_error_reason(
+            "error sending request for url (http://127.0.0.1:18084/health): client error (SendRequest): connection closed before message completed"
+        ),
+        "Agent Restarting / Tunnel Closed Mid-Request"
+    );
 }
 
 #[tokio::test]
