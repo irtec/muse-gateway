@@ -5,9 +5,6 @@
 # ==============================================================================
 set -euo pipefail
 
-GITHUB_REPO="${MUSE_GITHUB_REPO:-irtec/muse-gateway}"
-GITHUB_RAW_URL="${MUSE_RAW_URL:-https://raw.githubusercontent.com/${GITHUB_REPO}/main/deploy/vm-bootstrap}"
-GITHUB_RELEASE_URL="${MUSE_RELEASE_URL:-https://github.com/${GITHUB_REPO}/releases/latest/download}"
 BASE_URL="${MUSE_BASE_URL:-https://files.yourdomain.com/files/muse-agent-installer}"
 AUTH_USER="${MUSE_INSTALLER_USER:-admin}"
 AUTH_PASS="${MUSE_INSTALLER_PASS:-CHANGE_ME_PASSWORD}"
@@ -23,31 +20,20 @@ echo "=== [1/5] Creating standard agent directory structure ==="
 mkdir -p "${BIN_DIR}" "${CONFIG_DIR}" "${SYSTEMD_DIR}" "${LOGS_DIR}" "${DEBS_DIR}"
 
 echo "=== [2/5] Downloading muse-agent & frpc binaries ==="
-DOWNLOADED_AGENT=0
-if curl -fsSL -o "${BIN_DIR}/muse-agent" "${GITHUB_RELEASE_URL}/muse-agent" 2>/dev/null; then
-    DOWNLOADED_AGENT=1
-    echo "✔ Downloaded muse-agent from GitHub Releases (${GITHUB_REPO})"
-elif [ -n "${BASE_URL}" ] && curl -fsSL -u "${AUTH_USER}:${AUTH_PASS}" -o "${BIN_DIR}/muse-agent" "${BASE_URL}/muse-agent" 2>/dev/null; then
-    DOWNLOADED_AGENT=1
-    echo "✔ Downloaded muse-agent from backup mirror (${BASE_URL})"
-fi
-
-if [ "${DOWNLOADED_AGENT}" -eq 0 ] || [ ! -s "${BIN_DIR}/muse-agent" ]; then
-    echo "ERROR: Failed to download muse-agent binary from GitHub Releases or backup mirror!"
+if ! curl -fsSL -u "${AUTH_USER}:${AUTH_PASS}" -o "${BIN_DIR}/muse-agent" "${BASE_URL}/muse-agent"; then
+    echo "ERROR: Failed to download muse-agent binary from file server mirror (${BASE_URL})!"
     exit 1
 fi
+if [ ! -s "${BIN_DIR}/muse-agent" ]; then
+    echo "ERROR: Downloaded muse-agent binary is empty!"
+    exit 1
+fi
+echo "✔ Downloaded muse-agent from file server mirror (${BASE_URL})"
 chmod 0755 "${BIN_DIR}/muse-agent"
 
 if [ ! -f "${BIN_DIR}/frpc" ]; then
-    DOWNLOADED_FRPC=0
-    if curl -fsSL -o "${BIN_DIR}/frpc" "${GITHUB_RELEASE_URL}/frpc" 2>/dev/null; then
-        DOWNLOADED_FRPC=1
-        echo "✔ Downloaded frpc from GitHub Releases"
-    elif [ -n "${BASE_URL}" ] && curl -fsSL -u "${AUTH_USER}:${AUTH_PASS}" -o "${BIN_DIR}/frpc" "${BASE_URL}/frpc" 2>/dev/null; then
-        DOWNLOADED_FRPC=1
-        echo "✔ Downloaded frpc from backup mirror"
-    fi
-    if [ "${DOWNLOADED_FRPC}" -eq 1 ] && [ -s "${BIN_DIR}/frpc" ]; then
+    if curl -fsSL -u "${AUTH_USER}:${AUTH_PASS}" -o "${BIN_DIR}/frpc" "${BASE_URL}/frpc" 2>/dev/null && [ -s "${BIN_DIR}/frpc" ]; then
+        echo "✔ Downloaded frpc from file server mirror"
         chmod 0755 "${BIN_DIR}/frpc"
     else
         echo "WARN: frpc binary could not be downloaded yet (will be managed by supervisor if available)."
@@ -77,8 +63,10 @@ if [ ! -f "${CONFIG_DIR}/muse-agent.toml" ]; then
         exit 1
     fi
     TMP_AGENT=$(mktemp)
-    if ! curl -fsSL -o "${TMP_AGENT}" "${GITHUB_RAW_URL}/muse-agent.toml.example" 2>/dev/null; then
-        curl -fsSL -u "${AUTH_USER}:${AUTH_PASS}" -o "${TMP_AGENT}" "${BASE_URL}/muse-agent.toml.example"
+    if ! curl -fsSL -u "${AUTH_USER}:${AUTH_PASS}" -o "${TMP_AGENT}" "${BASE_URL}/muse-agent.toml.example"; then
+        echo "ERROR: Failed to download muse-agent.toml.example from file server mirror (${BASE_URL})!"
+        rm -f "${TMP_AGENT}"
+        exit 1
     fi
     sed -e "s/{{VM_ID}}/${VM_ID}/g" "${TMP_AGENT}" > "${CONFIG_DIR}/muse-agent.toml"
     rm -f "${TMP_AGENT}"
@@ -92,8 +80,10 @@ if [ ! -f "${CONFIG_DIR}/frpc.toml" ]; then
         exit 1
     fi
     TMP_FRPC=$(mktemp)
-    if ! curl -fsSL -o "${TMP_FRPC}" "${GITHUB_RAW_URL}/frpc.toml.example" 2>/dev/null; then
-        curl -fsSL -u "${AUTH_USER}:${AUTH_PASS}" -o "${TMP_FRPC}" "${BASE_URL}/frpc.toml.example"
+    if ! curl -fsSL -u "${AUTH_USER}:${AUTH_PASS}" -o "${TMP_FRPC}" "${BASE_URL}/frpc.toml.example"; then
+        echo "ERROR: Failed to download frpc.toml.example from file server mirror (${BASE_URL})!"
+        rm -f "${TMP_FRPC}"
+        exit 1
     fi
     sed -e "s/{{VM_ID}}/${VM_ID}/g" \
         -e "s/{{SSH_PORT}}/${SSH_PORT}/g" \
@@ -104,9 +94,7 @@ if [ ! -f "${CONFIG_DIR}/frpc.toml" ]; then
 fi
 
 # Download self-healing bootstrap runner & offline debs
-curl -fsSL -o "${TARGET_DIR}/run.sh" "${GITHUB_RAW_URL}/bootstrap.sh" 2>/dev/null || \
-curl -fsSL -u "${AUTH_USER}:${AUTH_PASS}" -o "${TARGET_DIR}/run.sh" "${BASE_URL}/bootstrap.sh" 2>/dev/null || true
-[ -f "${TARGET_DIR}/run.sh" ] && chmod 0755 "${TARGET_DIR}/run.sh" || true
+curl -fsSL -u "${AUTH_USER}:${AUTH_PASS}" -o "${TARGET_DIR}/run.sh" "${BASE_URL}/bootstrap.sh" 2>/dev/null && chmod 0755 "${TARGET_DIR}/run.sh" || true
 if ! ls "${DEBS_DIR}"/openssh-server*.deb >/dev/null 2>&1; then
     curl -fsSL -u "${AUTH_USER}:${AUTH_PASS}" -o "${DEBS_DIR}/openssh-server_9.6p1-3ubuntu13.19_amd64.deb" "${BASE_URL}/debs/openssh-server_9.6p1-3ubuntu13.19_amd64.deb" 2>/dev/null || true
 fi
