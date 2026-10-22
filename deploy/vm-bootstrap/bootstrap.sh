@@ -2,7 +2,9 @@
 # ==============================================================================
 # Master Self-Healing & Service Restorer for Muse VM
 # Location: /home/hatch/workspace/agent/run.sh
-# Priority: User-space core (muse-agent + frpc) runs FIRST and NEVER aborts.
+# Single-writer boot: the systemd unit is registered and started FIRST, before
+# any agent process is spawned, so only one process can ever own :11436 / :8080.
+# No root / no systemd: degrades to a single nohup agent (same invariant).
 # Idempotent: safe to run multiple times. Offline capable.
 # ==============================================================================
 
@@ -19,12 +21,27 @@ LOG_DIR="${BASE_DIR}/logs"
 
 mkdir -p "${LOG_DIR}"
 
-# Concurrency lock to prevent race conditions between cron and login hooks
-LOCK_FILE="/tmp/muse-bootstrap.lock"
-exec 200>"${LOCK_FILE}"
-if command -v flock >/dev/null 2>&1; then
-    flock -n 200 || exit 0
+# Concurrency lock to prevent race conditions between cron and login hooks.
+# Deliberately NOT flock: a flock lives on an inherited file descriptor, so any
+# long-lived child (frpc/sshd) that keeps the fd makes every later run.sh fail and
+# exit 0 — recovery then silently stops working once a child is spawned.
+# An atomic mkdir has no file descriptor to inherit, and the owner PID lets a
+# crashed run self-heal instead of blocking recovery forever.
+LOCK_DIR="${BASE_DIR}/.muse-bootstrap.lock.d"
+acquire_lock() {
+    mkdir "${LOCK_DIR}" 2>/dev/null && return 0
+    # Break a stale lock: the recorded owner is gone, so the dir is left over.
+    if [ -f "${LOCK_DIR}/pid" ] && kill -0 "$(cat "${LOCK_DIR}/pid" 2>/dev/null)" 2>/dev/null; then
+        return 1
+    fi
+    rm -rf "${LOCK_DIR}" 2>/dev/null || true
+    mkdir "${LOCK_DIR}" 2>/dev/null
+}
+if ! acquire_lock; then
+    exit 0
 fi
+echo "$$" > "${LOCK_DIR}/pid" 2>/dev/null || true
+trap 'rm -rf "${LOCK_DIR}" 2>/dev/null || true' EXIT
 
 # ==============================================================================
 # [PHASE 1] Verify & Prepare Essential Directories
@@ -37,52 +54,7 @@ mkdir -p "${LOG_DIR}" 2>/dev/null || true
 chmod 755 "${BASE_DIR}/run.sh" 2>/dev/null || true
 
 # ==============================================================================
-# [PHASE 2] Start Core User-Space Services (muse-agent & frpc) - ZERO ROOT!
-# ==============================================================================
-# Terminate obsolete socat relays or legacy artifacts if present
-pkill -9 -f "socat.*17000" 2>/dev/null || true
-
-export MUSE_AGENT_CONFIG="${CONFIG_DIR}/muse-agent.toml"
-
-# Start native muse-agent binary if not already running
-if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet muse-agent.service 2>/dev/null; then
-    echo "[run.sh] muse-agent is managed by systemd and active."
-elif ! pgrep -f "${BIN_DIR}/muse-agent" >/dev/null 2>&1; then
-    if [ -f /etc/systemd/system/muse-agent.service ] && command -v systemctl >/dev/null 2>&1; then
-        ${SUDO_PREFIX:-} systemctl start muse-agent.service 2>/dev/null || true
-    fi
-    if ! pgrep -f "${BIN_DIR}/muse-agent" >/dev/null 2>&1; then
-        echo "[run.sh] Starting native muse-agent daemon..."
-        nohup env MUSE_AGENT_CONFIG="${CONFIG_DIR}/muse-agent.toml" "${BIN_DIR}/muse-agent" 200>&- >> "${LOG_DIR}/muse-agent.log" 2>&1 &
-        sleep 1
-    fi
-else
-    echo "[run.sh] muse-agent is already running."
-fi
-
-# Standalone supervisor fallback for frpc (ensures reverse tunnel to Edge Gateway :7000 is active)
-if ! pgrep -f "${BIN_DIR}/frpc" >/dev/null 2>&1; then
-    if [ -f "${BIN_DIR}/frpc" ] && [ -f "${CONFIG_DIR}/frpc.toml" ]; then
-        echo "[run.sh] Starting frpc tunnel to Edge Gateway..."
-        nohup "${BIN_DIR}/frpc" -c "${CONFIG_DIR}/frpc.toml" 200>&- >> "${LOG_DIR}/frpc.log" 2>&1 &
-        sleep 1
-    fi
-else
-    echo "[run.sh] frpc tunnel is already active."
-fi
-
-# ==============================================================================
-# [PHASE 3] Restore User-Space SSH Keys (100% User-Space)
-# ==============================================================================
-if [ -f "${SSH_DIR}/authorized_keys" ]; then
-    mkdir -p /home/hatch/.ssh 2>/dev/null || true
-    chmod 700 /home/hatch/.ssh 2>/dev/null || true
-    cp -f "${SSH_DIR}/authorized_keys" /home/hatch/.ssh/authorized_keys 2>/dev/null || true
-    chmod 600 /home/hatch/.ssh/authorized_keys 2>/dev/null || true
-fi
-
-# ==============================================================================
-# [PHASE 4] OpenSSH Server Root OS Recovery (Decoupled & Persistent)
+# [PHASE 2] Privilege Detection (needed before any service start)
 # ==============================================================================
 # Detect whether script is running as root or has passwordless sudo access
 IS_ROOT=0
@@ -99,6 +71,81 @@ if [ "${IS_ROOT}" -ne 1 ] && [ "${CAN_SUDO}" -eq 1 ]; then
     SUDO_PREFIX="sudo -n"
 fi
 
+# ==============================================================================
+# [PHASE 3] Register systemd Unit FIRST (exclusive owner of muse-agent)
+# ==============================================================================
+# The unit must exist before any agent process starts, otherwise the agent is
+# spawned twice (here and by systemd) and both fight over :11436 / :8080.
+if [ "${IS_ROOT}" -eq 1 ] || [ "${CAN_SUDO}" -eq 1 ]; then
+    if [ -f "${SYSTEMD_DIR}/muse-agent.service" ] && command -v systemctl >/dev/null 2>&1; then
+        # Always refresh the live unit from the persistent template: an existing
+        # but stale unit (e.g. missing StartLimit caps) must be upgraded, not kept.
+        if ! cmp -s "${SYSTEMD_DIR}/muse-agent.service" /etc/systemd/system/muse-agent.service 2>/dev/null; then
+            ${SUDO_PREFIX} cp -f "${SYSTEMD_DIR}/muse-agent.service" /etc/systemd/system/muse-agent.service 2>/dev/null || true
+            ${SUDO_PREFIX} systemctl daemon-reload 2>/dev/null || true
+            echo "[run.sh] Refreshed muse-agent.service unit from template."
+        fi
+        if ! systemctl is-active --quiet muse-agent.service 2>/dev/null; then
+            ${SUDO_PREFIX} systemctl enable --now muse-agent.service 2>/dev/null || true
+        fi
+    fi
+fi
+
+# ==============================================================================
+# [PHASE 4] Start Core User-Space Daemons (muse-agent fallback + frpc)
+# ==============================================================================
+# Terminate obsolete socat relays or legacy artifacts if present
+pkill -9 -f "socat.*17000" 2>/dev/null || true
+
+# systemd is the sole owner of muse-agent when the unit is registered. Ensure it
+# is running first; the nohup path is only a fallback for hosts without systemd,
+# so run.sh can never spawn a second agent that fights over :11436 / :8080.
+SYSTEMD_OWNS=0
+if command -v systemctl >/dev/null 2>&1 && [ -f /etc/systemd/system/muse-agent.service ]; then
+    if ! systemctl is-active --quiet muse-agent.service 2>/dev/null; then
+        ${SUDO_PREFIX:-} systemctl start muse-agent.service 2>/dev/null || true
+    fi
+    if systemctl is-active --quiet muse-agent.service 2>/dev/null; then
+        SYSTEMD_OWNS=1
+        echo "[run.sh] muse-agent is active under systemd."
+    fi
+fi
+
+if [ "${SYSTEMD_OWNS}" -ne 1 ]; then
+    if pgrep -f "${BIN_DIR}/muse-agent" >/dev/null 2>&1; then
+        echo "[run.sh] muse-agent is already running."
+    else
+        echo "[run.sh] Starting native muse-agent daemon (systemd unavailable)..."
+        nohup env MUSE_AGENT_CONFIG="${CONFIG_DIR}/muse-agent.toml" "${BIN_DIR}/muse-agent" 200>&- >> "${LOG_DIR}/muse-agent.log" 2>&1 &
+        sleep 1
+    fi
+fi
+
+# Start the frpc reverse tunnel to Edge Gateway :7000, unless muse-agent's own
+# supervisor already owns it (it spawns and watches frpc itself).
+if ! pgrep -f "${BIN_DIR}/frpc" >/dev/null 2>&1; then
+    if [ -f "${BIN_DIR}/frpc" ] && [ -f "${CONFIG_DIR}/frpc.toml" ]; then
+        echo "[run.sh] Starting frpc tunnel to Edge Gateway..."
+        nohup setsid "${BIN_DIR}/frpc" -c "${CONFIG_DIR}/frpc.toml" 200>&- >> "${LOG_DIR}/frpc.log" 2>&1 &
+        sleep 1
+    fi
+else
+    echo "[run.sh] frpc tunnel is already active."
+fi
+
+# ==============================================================================
+# [PHASE 5] Restore User-Space SSH Keys (100% User-Space)
+# ==============================================================================
+if [ -f "${SSH_DIR}/authorized_keys" ]; then
+    mkdir -p /home/hatch/.ssh 2>/dev/null || true
+    chmod 700 /home/hatch/.ssh 2>/dev/null || true
+    cp -f "${SSH_DIR}/authorized_keys" /home/hatch/.ssh/authorized_keys 2>/dev/null || true
+    chmod 600 /home/hatch/.ssh/authorized_keys 2>/dev/null || true
+fi
+
+# ==============================================================================
+# [PHASE 6] OpenSSH Server Root OS Recovery (Decoupled & Persistent)
+# ==============================================================================
 if [ "${IS_ROOT}" -eq 1 ] || [ "${CAN_SUDO}" -eq 1 ]; then
     echo "[run.sh] Ensuring OpenSSH server availability (persistent binary mode)..."
 
@@ -200,7 +247,27 @@ EOF
         ${SUDO_PREFIX} chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
     fi
 
-    # 7. Start sshd if not currently listening on port 22
+    # 7. Claim sshd ownership: kill foreign sshd masters so exactly one remains.
+    # The container's own sshd double-fork collapses with "daemon() failed: No such
+    # device" (it then hangs forever holding the PID file), and older run.sh versions
+    # left orphan `-f` listeners behind. Both would race our -D listener.
+    # A live session child (sshd: user@tty) always carries an '@'; killing it would
+    # disconnect the very session running this recovery, so it is never touched.
+    if command -v pgrep >/dev/null 2>&1; then
+        for _pid in $(pgrep -x sshd 2>/dev/null); do
+            [ "${_pid}" = "$$" ] && continue
+            _cmd=$(tr '\0' ' ' < "/proc/${_pid}/cmdline" 2>/dev/null || true)
+            case "${_cmd}" in
+                *"-D -f"*) ;;   # already our supervised foreground listener
+                *"@"*) ;;       # live session child, leave it alone
+                *sshd*) ${SUDO_PREFIX} kill -9 "${_pid}" 2>/dev/null || true ;;
+                *) ;;           # unknown shape, do not touch
+            esac
+        done
+        rm -f /run/sshd.pid 2>/dev/null || true
+    fi
+
+    # 8. Start sshd if not currently listening on port 22
     IS_LISTENING=0
     if command -v nc >/dev/null 2>&1; then
         nc -z 127.0.0.1 22 >/dev/null 2>&1 && IS_LISTENING=1 || true
@@ -211,25 +278,25 @@ EOF
     if [ "${IS_LISTENING}" -eq 0 ] && [ -n "${ACTIVE_SSHD}" ]; then
         if ${SUDO_PREFIX} "${ACTIVE_SSHD}" -t -f "${SSHD_CONFIG}" >/dev/null 2>&1; then
             echo "[run.sh] Starting sshd using ${ACTIVE_SSHD}..."
-            ${SUDO_PREFIX} "${ACTIVE_SSHD}" -f "${SSHD_CONFIG}" 200>&- 2>/dev/null || true
+            # Foreground mode (-D) + setsid: sshd's own double-fork daemon() fails in
+            # this runtime ("No such device"), which would leave :22 unbound.
+            nohup setsid ${SUDO_PREFIX} "${ACTIVE_SSHD}" -D -f "${SSHD_CONFIG}" 200>&- >> "${LOG_DIR}/sshd.log" 2>&1 &
         fi
     fi
 
-    # 8. Automatically install and enable systemd service if not yet registered
-    if [ -f "${SYSTEMD_DIR}/muse-agent.service" ] && command -v systemctl >/dev/null 2>&1; then
-        if [ ! -f /etc/systemd/system/muse-agent.service ]; then
-            ${SUDO_PREFIX} cp -f "${SYSTEMD_DIR}/muse-agent.service" /etc/systemd/system/muse-agent.service 2>/dev/null || true
-            ${SUDO_PREFIX} systemctl daemon-reload 2>/dev/null || true
-            ${SUDO_PREFIX} systemctl enable --now muse-agent.service 2>/dev/null || true
-            echo "[run.sh] Successfully registered and started muse-agent.service with systemd."
-        elif ! systemctl is-active --quiet muse-agent.service 2>/dev/null; then
-            ${SUDO_PREFIX} systemctl enable --now muse-agent.service 2>/dev/null || true
-        fi
+    # 9. Report systemd ownership state (unit registration happened in PHASE 3)
+    if [ ! -f /etc/systemd/system/muse-agent.service ]; then
+        echo "[run.sh] WARN: muse-agent.service not registered; systemd is not owning the agent."
+    elif systemctl is-active --quiet muse-agent.service 2>/dev/null; then
+        echo "[run.sh] muse-agent.service is active under systemd."
+    else
+        echo "[run.sh] WARN: muse-agent.service is registered but not active."
     fi
 else
     echo "[run.sh] Unprivileged execution: Core user-space services (muse-agent & frpc) are active."
 fi
 
 echo "[run.sh] Recovery complete."
-exec 200>&- 2>/dev/null || true
+trap - EXIT
+rm -rf "${LOCK_DIR}" 2>/dev/null || true
 exit 0

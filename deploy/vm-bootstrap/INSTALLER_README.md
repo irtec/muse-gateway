@@ -198,6 +198,8 @@ cat << 'EOF' > /home/hatch/workspace/agent/systemd/muse-agent.service
 [Unit]
 Description=Muse Agent (Native Rust HTTP to UDS space-inference bridge)
 After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -269,6 +271,5 @@ pkill -9 -x frpc 2>/dev/null || true
 
 rm -rf /home/hatch/workspace/agent \
        /tmp/muse-agent* \
-       /tmp/frpc* \
-       /tmp/muse-bootstrap.lock
+       /tmp/frpc*
 ```

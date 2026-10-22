@@ -91,7 +91,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = create_agent_router(state);
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
 
-    // 3. Start File Manager if enabled in configuration
+    // 3. Bind the primary HTTP listener FIRST: a failure here means another
+    // process already owns this port, so we abort before touching anything else.
+    info!("Binding HTTP server to {}", addr);
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            tracing::error!(
+                "Address already in use on {}: another muse-agent is likely running. Aborting to avoid a double-start race.",
+                addr
+            );
+            return Err(e.into());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    info!("muse-agent HTTP listening on http://{}", addr);
+
+    // 4. Start File Manager if enabled in configuration
     if config.file_manager.enabled {
         let mut fm_config = config.file_manager.clone();
         if fm_config.auth_token.is_none() {
@@ -116,13 +132,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Failed to bind file-manager to {}: {}", fm_addr, e);
+                    tracing::error!(
+                        "Failed to bind file-manager to {}: {}. Continuing without it (primary HTTP bridge unaffected).",
+                        fm_addr, e
+                    );
                 }
             }
         });
     }
 
-    // 4. Start One-Way Native Sync if role == Replica
+    // 5. Start One-Way Native Sync if role == Replica
     if config.sync.enabled && config.sync.role == muse_agent::SyncRole::Replica {
         let auth_token = config
             .sync
@@ -140,10 +159,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sync_client.run_loop().await;
         });
     }
-
-    info!("Binding HTTP server to {}", addr);
-    let listener = TcpListener::bind(addr).await?;
-    info!("muse-agent HTTP listening on http://{}", addr);
 
     axum::serve(listener, app).await?;
 

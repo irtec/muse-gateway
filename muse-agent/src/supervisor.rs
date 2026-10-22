@@ -51,6 +51,7 @@ pub struct ProcessSupervisor {
     config: SupervisorConfig,
     vm_id: String,
     frpc_child: Arc<Mutex<Option<Child>>>,
+    ssh_child: Arc<Mutex<Option<Child>>>,
     ssh_install_lock: Arc<Mutex<()>>,
     ssh_last_failure: Arc<Mutex<Option<Instant>>>,
     last_update_error: Arc<std::sync::Mutex<Option<String>>>,
@@ -62,6 +63,7 @@ impl ProcessSupervisor {
             config,
             vm_id,
             frpc_child: Arc::new(Mutex::new(None)),
+            ssh_child: Arc::new(Mutex::new(None)),
             ssh_install_lock: Arc::new(Mutex::new(())),
             ssh_last_failure: Arc::new(Mutex::new(None)),
             last_update_error: Arc::new(std::sync::Mutex::new(None)),
@@ -824,24 +826,38 @@ impl ProcessSupervisor {
             active_sshd_bin.display()
         );
 
-        let spawn_res = if is_root {
-            Command::new(&active_sshd_bin)
-                .arg("-f")
-                .arg(&sshd_config_path)
-                .spawn()
-        } else {
-            Command::new("sudo")
-                .arg("-n")
-                .arg(&active_sshd_bin)
-                .arg("-f")
-                .arg(&sshd_config_path)
-                .spawn()
-        };
+        // 12a. In environments without a functional daemon()/setsid (e.g. the
+        // containerised runtime here), the double-fork detach fails with
+        // "daemon() failed: No such device" and sshd dies immediately. Run sshd in
+        // the foreground (-D) as our own child instead; systemd's cgroup teardown
+        // reaps it on restart, so no stale listener can leak across restarts.
+        let mut ssh_child = self.ssh_child.lock().await;
+        if let Some(child) = ssh_child.as_mut() {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                *ssh_child = None;
+            }
+        }
+        if ssh_child.is_none() {
+            let mut cmd = if is_root {
+                Command::new(&active_sshd_bin)
+            } else {
+                let mut c = Command::new("sudo");
+                c.args(["-n", &active_sshd_bin.to_string_lossy()]);
+                c
+            };
+            cmd.args(["-D", "-f", &sshd_config_path.to_string_lossy()]);
 
-        if let Err(e) = spawn_res {
-            error!("Failed to spawn sshd daemon: {}", e);
-            *self.ssh_last_failure.lock().await = Some(Instant::now());
-            return;
+            match cmd.spawn() {
+                Ok(child) => {
+                    info!("sshd spawned in foreground mode (-D) as supervised child.");
+                    *ssh_child = Some(child);
+                }
+                Err(e) => {
+                    error!("Failed to spawn sshd daemon: {}", e);
+                    *self.ssh_last_failure.lock().await = Some(Instant::now());
+                    return;
+                }
+            }
         }
 
         // 13. Confirm listen on :22 within 5 seconds before marking subservice healthy
@@ -896,11 +912,17 @@ impl ProcessSupervisor {
                 }
             }
         } else {
-            // Check if any external healthy (non-zombie) frpc is already running.
-            // A zombie / defunct process appears in `pgrep` but is not actually alive.
+            // Detect an existing healthy frpc. Match on the binary PATH in argv (not
+            // the process name) so a zombie or an unrelated process cannot mask a
+            // live tunnel; `ensure_frpc_running` re-runs after every auto-update
+            // restart, and name-based matching made it spawn a duplicate each time.
+            let probe = format!(
+                "ps -eo stat,args 2>/dev/null | awk -v p='{bin}' '$1 !~ /^Z/ && index($0,p) > 0'",
+                bin = frpc_bin.display()
+            );
             let is_alive = Command::new("sh")
                 .arg("-c")
-                .arg("ps -eo stat,comm 2>/dev/null | grep -E '^[RSDTW].*frpc' || pgrep -x frpc")
+                .arg(&probe)
                 .output()
                 .await
                 .map(|o| o.status.success() && !o.stdout.is_empty())
@@ -927,9 +949,12 @@ impl ProcessSupervisor {
                 frpc_bin.display(),
                 frpc_cfg.display()
             );
+            // Own process group: frpc must not die with a signal aimed at the agent's
+            // group, and systemd's control-group teardown still reaps it on restart.
             match Command::new(&frpc_bin)
                 .arg("-c")
                 .arg(&frpc_cfg)
+                .process_group(0)
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
                 .spawn()

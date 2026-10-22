@@ -18,6 +18,8 @@ DEBS_DIR="${TARGET_DIR}/debs"
 
 echo "=== [1/5] Creating standard agent directory structure ==="
 mkdir -p "${BIN_DIR}" "${CONFIG_DIR}" "${SYSTEMD_DIR}" "${LOGS_DIR}" "${DEBS_DIR}"
+# group-writable so an unprivileged (hatch) run.sh can keep recovery working
+chmod 2775 "${BASE_DIR}" 2>/dev/null || true
 
 echo "=== [2/5] Downloading muse-agent & frpc binaries ==="
 if ! curl -fsSL -u "${AUTH_USER}:${AUTH_PASS}" -o "${BIN_DIR}/muse-agent" "${BASE_URL}/muse-agent"; then
@@ -125,6 +127,10 @@ cat << 'EOF' > "${SYSTEMD_DIR}/muse-agent.service"
 [Unit]
 Description=Muse Agent (Native Rust HTTP to UDS space-inference bridge)
 After=network.target
+# Cap restart storms: if the port is held by another process, stop retrying and
+# surface a single failure instead of spinning forever.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
