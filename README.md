@@ -127,7 +127,7 @@ Each worker node runs `muse-agent` alongside `frpc` to bridge AI inference, SSH,
 #### Automated One-Line Installation (Recommended)
 Run inside the target worker VM:
 ```bash
-VM_ID=vm2 curl -fsSL https://raw.githubusercontent.com/irtec/muse-gateway/refs/heads/main/deploy/vm-bootstrap/install.sh | bash
+VM_ID=vm2 curl -fsSL -u admin:YOUR_PASSWORD https://files.yourdomain.com/files/muse-agent-installer/install.sh | bash
 ```
 
 *Note: The script automatically calculates port assignments based on `VM_ID` (SSH: `2220+N`, AI: `18080+N`, File Server: `18090+N`). For detailed manual steps, see [`deploy/vm-bootstrap/INSTALLER_README.md`](./deploy/vm-bootstrap/INSTALLER_README.md).*

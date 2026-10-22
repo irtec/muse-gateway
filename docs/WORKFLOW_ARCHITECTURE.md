@@ -301,7 +301,7 @@ Adding extra worker nodes enables zero-downtime failover and load balancing.
 1. **Bootstrap Worker via Automated Script:**
    On the new VM, execute the one-line installer:
    ```bash
-   VM_ID=vm2 curl -fsSL https://raw.githubusercontent.com/irtec/muse-gateway/refs/heads/main/deploy/vm-bootstrap/install.sh | bash
+   VM_ID=vm2 curl -fsSL -u admin:CHANGE_ME_PASSWORD https://files.yourdomain.com/files/muse-agent-installer/install.sh | bash
    ```
 
 2. **Register Worker in Hub Configuration on Edge Gateway:**
@@ -332,26 +332,27 @@ Adding extra worker nodes enables zero-downtime failover and load balancing.
 
 ## 7. Fleet-Wide Rolling Auto-Update Workflow
 
-The `muse-agent` daemon contains a built-in atomic self-updating engine that enables rolling upgrades across all sandbox worker VMs without requiring manual SSH intervention or cluster downtime. Updates can be propagated either via automated **GitHub Releases** (version-based polling) or via internal **file sync**.
+The `muse-agent` daemon contains a built-in atomic self-updating engine that enables rolling upgrades across all sandbox worker VMs without manual SSH intervention or cluster downtime. Updates propagate exclusively through the internal **file sync** channel, since sandbox egress to external hosts is blocked.
 
 ```
-    GitHub Releases (v* tag push)                Master (VM-01)
- ┌─────────────────────────────────┐       ┌─────────────────────────┐
- │ CI/CD: Automated Musl Build     │       │ Local Mirror (Fallback) │
- │ - version.txt                   │       │ public/files/           │
- │ - muse-agent + muse-hub         │       │ muse-agent-installer/   │
- │ - SHA-256 checksums             │       └───────────┬─────────────┘
- └────────────────┬────────────────┘                   │
-                  │ (HTTP GET)                         │ (One-Way Sync)
-                  ▼                                    ▼
+        Master (VM-01) File Server
+ ┌──────────────────────────────────────┐
+ │ public/files/muse-agent-installer/   │
+ │ - muse-agent (active release binary) │
+ │ - install.sh / bootstrap.sh          │
+ │ - *.toml.example config templates    │
+ └───────────────────┬──────────────────┘
+                     │ (One-Way Delta Sync, 30s interval)
+                     ▼
        ┌────────────────────────────────────────────────────────┐
-       │ Replica Workers (VM-01..04 ProcessSupervisor)          │
-       │ 1. Check version.txt vs CARGO_PKG_VERSION              │
-       │ 2. Staggered Delay: (VM# - 1) * 20s (Anti-Split-Brain) │
-       │ 3. Download to temp file: muse-agent.update.<uuid>     │
-       │ 4. Integrity gate: Size >= 2 MB & SHA-256 verification │
-       │ 5. Atomic POSIX swap: rename(temp, active_bin)         │
-       │ 6. Log upgrade & graceful exit(0)                      │
+       │ Each Worker (VM-01..04) ProcessSupervisor              │
+       │ 1. Poll synced copy every 5s (check_interval_secs)     │
+       │ 2. Integrity gate: Size >= 2 MB                        │
+       │ 3. Compare SHA-256: synced binary vs active binary     │
+       │ 4. Copy to temp file: muse-agent.update.<uuid>         │
+       │ 5. Re-verify temp SHA-256 matches synced source        │
+       │ 6. Atomic POSIX swap: rename(temp, active_bin)         │
+       │ 7. Log upgrade & graceful exit(0)                      │
        └──────────────────────────┬─────────────────────────────┘
                                   │
                        ┌──────────▼──────────────┐
@@ -363,23 +364,24 @@ The `muse-agent` daemon contains a built-in atomic self-updating engine that ena
 
 ### Auto-Update Mechanics & Invariants
 
-1. **Version-Based GitHub Releases Polling:**
-   - Background task on each agent polls `https://github.com/{github_repo}/releases/latest/download/version.txt` at configurable intervals (default: 30 minutes / 1800s).
-   - If `remote_version > current_version`, the upgrade pipeline triggers automatically.
-2. **Staggered Rolling Delay (Anti-Split-Brain / Zero Downtime):**
-   - Each VM calculates a non-overlapping sleep delay based on its VM number (e.g. VM-01: 0s, VM-02: 20s, VM-03: 40s, VM-04: 60s).
-   - `muse-hub` on the Edge Gateway routes incoming inference and file-manager requests to other active workers while one node restarts (~1–2 seconds).
+1. **Two-Stage Sync Detection:**
+   - Replicas run `SyncClient` against the master's `/internal/sync/manifest` endpoint over the frp reverse tunnel (default 30s interval). The global `version_hash` short-circuits cycles with no filesystem changes.
+   - Each agent's `ProcessSupervisor` then compares the synced installer binary against its own active binary every `check_interval_secs` (default 5s).
+2. **Zero-Downtime Rolling Restarts:**
+   - Workers sync independently, so download completion and restart times are naturally desynchronized across the fleet.
+   - `muse-hub` on the Edge Gateway routes incoming inference and file-manager requests to the remaining healthy workers while one node restarts (~1–2 seconds).
 3. **Safety & Sanity Thresholds:**
-   - **Size Check:** The binary must be at least 2,000,000 bytes (2 MB) to prevent executing truncated or empty files.
-   - **Cryptographic Hash Validation:** Fetches `muse-agent.sha256` from GitHub Releases and validates the downloaded binary before replacing the active executable.
+   - **Size Check:** The binary must be at least 2,000,000 bytes (2 MB) to prevent executing truncated or partially written files.
+   - **Cryptographic Hash Validation:** SHA-256 is computed on the synced source, then recomputed on the staged temp file. The swap only proceeds if both hashes match.
 4. **Atomic File Staging & Replacement:**
    - The new executable is staged in a temporary file on the same filesystem (`agent/bin/muse-agent.update.<uuid>`).
    - Permissions are explicitly set to `0755` (`rwxr-xr-x`).
-   - The SHA-256 hash of the temp file is verified against the remote hash to eliminate partial write risks.
    - The active executable is atomically swapped using POSIX rename (`std::fs::rename`).
 5. **Graceful Handover & Supervisor Restart:**
-   - Once the file is replaced, `muse-agent` logs the successful upgrade with version and SHA-256 digests, waits 500 ms for log buffers to flush, and terminates cleanly via `std::process::exit(0)`.
+   - Once the file is replaced, `muse-agent` logs the successful upgrade with the SHA-256 digest, waits 500 ms for log buffers to flush, and terminates cleanly via `std::process::exit(0)`.
    - The registered service manager (`systemd` via `Restart=always` or the platform supervisor watchdog via `/home/hatch/workspace/agent/run.sh`) immediately launches the newly installed binary.
+
+> **Critical:** The installer binary lives at `public/files/muse-agent-installer/muse-agent`, which is the sync source **and** the update source. Publishing a new build must replace this file, not only `agent/bin/muse-agent`. If only `bin/` is updated, `ensure_binary_update()` detects the hash difference against the older installer copy and reverts the node to the previous version within 5 seconds.
 
 ---
 
