@@ -13,6 +13,7 @@ All-in-One Native Rust Worker Node Daemon & Service Supervisor.
    - Translates incoming REST calls directly into Hatch Unix Domain Socket binary wire protocol (4-byte Big-Endian Length Prefix + JSON) over `/run/hatch/sandbox/space-inference.sock` and `/run/hatch/sandbox/space-media.sock` (for `/v1/images/generations`).
    - `/health` bounds its UDS liveness ping at 2 seconds and reports the socket as ready when the ping times out, so a model busy with inference is never mistaken for a dead node.
    - **Quota exhaustion is reported as quota, not as a fault.** When the model's account runs out of credits, the bridge answers `429` with `x-muse-error: insufficient_quota` and a message stating that every service on the node is running normally. The hub uses that header to fail over without ever marking the node unhealthy.
+   - **The real allowance comes from the platform, not from a counter.** `subscription-status status` reports the percent of the weekly limit used, the reset time, and any bonus tokens left; the agent samples it every 60 seconds and exposes the cached result as `quota` on `/health`. The sandbox sockets expose no credit balance at all. A failed sample reports `available: false` — unknown, never "fine".
 
 2. **Process Supervisor & Tunnel Manager:**
    - Supervises the lifecycle of the `frpc` reverse proxy tunnel connected to the Edge Gateway (`:7000`).

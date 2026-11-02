@@ -9,9 +9,10 @@ Central AI Gateway, Dynamic Load Balancer, and Health Monitoring Hub.
 ## Key Features
 
 1. **Zero-502 Transparent Failover:**
-   - If a designated worker experiences an outage, timeout, or returns an HTTP 5xx error, the gateway seamlessly retries the request across subsequent healthy workers up to 3 times.
-   - External clients never encounter a `502 Bad Gateway` error as long as at least one worker node remains operational.
+   - A worker that fails is skipped and the request re-sent to an alternate node. Retryable statuses are any `5xx` plus `408`, `422` and `429`; each worker is tried once, up to 5 attempts, so a transient upstream fault never reaches the caller.
+   - External clients never encounter a `502 Bad Gateway` error as long as at least one worker node remains operational. If every node has been tried, the reply is `503 upstream_unavailable`, which says the hub already retried everything.
    - **Quota is not a fault:** when a worker's upstream account runs out of credits it answers `429` with the `x-muse-error: insufficient_quota` header. The hub fails the request over to a node that still has credits; if every node is out, the client receives that explicit `429` quota explanation instead of a misleading gateway error. The quota-exhausted node stays `healthy` throughout.
+   - **Quota routing uses the platform's own reset time.** Each agent samples `subscription-status` and reports the real allowance on `/health`. A node whose weekly limit is spent is skipped by round-robin until that printed reset moment (plus a 60s cushion), so requests are never wasted on an account that cannot serve them. Without a reported reset time a 5-minute fallback applies, so a node is never stranded out of rotation.
 
 2. **Dynamic Round-Robin Load Balancing:**
    - Rotates requests atomically using lock-free index increments (`AtomicUsize`) across all workers verified as `healthy`.
