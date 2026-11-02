@@ -674,6 +674,11 @@ fn online_alert_reports_the_allowance_like_the_app_card() {
     let msg = format_online_alert(&worker, &overview);
 
     assert!(
+        msg.starts_with("🟢 *[MUSE-HUB] Worker Online & Healthy* — `VM-04 (Worker)`"),
+        "the header must name the node so the alert is readable on its own: {}",
+        msg
+    );
+    assert!(
         msg.contains("*Quota:* ✅ Free plan · 28% used · resets Nov 4 at 12:04 AM UTC · bonus 999M tokens left"),
         "the alert must mirror the app's usage card: {}",
         msg

@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning is [SemVer](https://semver.org/).
 
+## [0.1.13] - 2026-11-02
+
+Alert headers named the product, not the node: `[MUSE-HUB] Worker Fully Online &
+Healthy` told an operator nothing about which worker had just come back. Every
+header now carries the node, so a notification reads on its own.
+
+### Changed
+
+- All alert headers name the node, e.g.
+  `🟢 [MUSE-HUB] Worker Online & Healthy — VM-04 (Worker)`. This covers the
+  online, offline, degraded, HTTP-error, pool-offline, auto-update success and
+  auto-update failed alerts.
+- The `*Node:*` line stays for alerts that show a full status block; the header
+  is what shows in a Telegram notification preview.
+
 ## [0.1.12] - 2026-11-02
 
 The quota figures were wrong in a way that mattered: the agent counted tokens in
@@ -46,6 +61,8 @@ real allowance — just not on the sockets the bridge was probing.
   only mentions them when the platform reports some. Without a bonus balance the
   percentage is the whole story.
 - A spent allowance reads `LIMIT REACHED`; an unsampled one reads `unknown`.
+- Every alert header names the node, so a notification is readable on its own:
+  `🟢 [MUSE-HUB] Worker Online & Healthy — VM-04 (Worker)`.
 - Fleet lines drop the redundant `Healthy` label and carry the version inline:
   `• 🟢 VM-02 (Backup) v0.1.12: 8% used · 1B tokens left`. Token counters are
   only appended once the node has served traffic, so a fresh process no longer

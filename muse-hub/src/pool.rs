@@ -556,7 +556,7 @@ pub fn format_offline_alert(
 
     if healthy == 0 {
         format!(
-            "🚨 *[MUSE-HUB] CRITICAL: Entire Pool Offline!*\n\
+            "🚨 *[MUSE-HUB] CRITICAL: Entire Pool Offline* — `{}`\n\
             ━━━━━━━━━━━━━━━━━━━━━\n\
             *Last Node:* `{}`\n\
             *Version:* `{}`\n\
@@ -567,11 +567,11 @@ pub fn format_offline_alert(
             ━━━━━━━━━━━━━━━━━━━━━\n\
             ⚠️ *All inference workers are down! AI requests will fail until a node recovers.*\n\
             *Time:* `{}`",
-            w.name, version_str, ssh_info, reason, fleet_overview, time_str
+            w.name, w.name, version_str, ssh_info, reason, fleet_overview, time_str
         )
     } else {
         format!(
-            "🔴 *[MUSE-HUB] Worker Offline (Confirmed)*\n\
+            "🔴 *[MUSE-HUB] Worker Offline* — `{}`\n\
             ━━━━━━━━━━━━━━━━━━━━━\n\
             *Node:* `{}`\n\
             *Version:* `{}`\n\
@@ -583,7 +583,7 @@ pub fn format_offline_alert(
             ━━━━━━━━━━━━━━━━━━━━━\n\
             *Action:* Auto-failover redirected to another healthy node\n\
             *Time:* `{}`",
-            w.name, version_str, ssh_info, reason, fleet_overview, time_str
+            w.name, w.name, version_str, ssh_info, reason, fleet_overview, time_str
         )
     }
 }
@@ -613,7 +613,7 @@ pub fn format_online_alert(w: &WorkerStatus, fleet_overview: &str) -> String {
     };
 
     format!(
-        "🟢 *[MUSE-HUB] Worker Fully Online & Healthy*\n\
+        "🟢 *[MUSE-HUB] Worker Online & Healthy* — `{}`\n\
         ━━━━━━━━━━━━━━━━━━━━━\n\
         *Node:* `{}`\n\
         *Version:* `{}`\n\
@@ -629,6 +629,7 @@ pub fn format_online_alert(w: &WorkerStatus, fleet_overview: &str) -> String {
         {}\n\
         ━━━━━━━━━━━━━━━━━━━━━\n\
         *Time:* `{}`",
+        w.name,
         w.name,
         version_str,
         ssh_info,
@@ -661,7 +662,7 @@ pub fn format_degraded_alert(w: &WorkerStatus, fleet_overview: &str, elapsed_sec
     let time_str = Local::now().format("%Y-%m-%d %H:%M:%S");
 
     format!(
-        "🟡 *[MUSE-HUB] Worker Degraded (Grace Window Timeout)*\n\
+        "🟡 *[MUSE-HUB] Worker Degraded* — `{}`\n\
         ━━━━━━━━━━━━━━━━━━━━━\n\
         *Node:* `{}`\n\
         *Version:* `{}`\n\
@@ -675,7 +676,15 @@ pub fn format_degraded_alert(w: &WorkerStatus, fleet_overview: &str, elapsed_sec
         {}\n\
         ━━━━━━━━━━━━━━━━━━━━━\n\
         *Time:* `{}`",
-        w.name, version_str, ssh_info, elapsed_secs, failed, checklist, fleet_overview, time_str
+        w.name,
+        w.name,
+        version_str,
+        ssh_info,
+        elapsed_secs,
+        failed,
+        checklist,
+        fleet_overview,
+        time_str
     )
 }
 
@@ -702,7 +711,7 @@ pub fn format_http_degraded_alert(
     let time_str = Local::now().format("%Y-%m-%d %H:%M:%S");
 
     format!(
-        "🔴 *[MUSE-HUB] Worker HTTP Error*\n\
+        "🔴 *[MUSE-HUB] Worker HTTP Error* — `{}`\n\
         ━━━━━━━━━━━━━━━━━━━━━\n\
         *Node:* `{}`\n\
         *Version:* `{}`\n\
@@ -714,7 +723,7 @@ pub fn format_http_degraded_alert(
         ━━━━━━━━━━━━━━━━━━━━━\n\
         *Action:* Auto-failover redirected to another healthy node\n\
         *Time:* `{}`",
-        w.name, version_str, ssh_info, status_code, fleet_overview, time_str
+        w.name, w.name, version_str, ssh_info, status_code, fleet_overview, time_str
     )
 }
 
@@ -741,7 +750,7 @@ pub fn format_upgrade_success_alert(
     let time_str = Local::now().format("%Y-%m-%d %H:%M:%S");
 
     format!(
-        "🚀 *[MUSE-HUB] Worker Auto-Update Successful*\n\
+        "🚀 *[MUSE-HUB] Auto-Update Successful* — `{}`\n\
         ━━━━━━━━━━━━━━━━━━━━━\n\
         *Node:* `{}`\n\
         *Version:* `{}` ➔ `{}`\n\
@@ -751,7 +760,7 @@ pub fn format_upgrade_success_alert(
         {}\n\
         ━━━━━━━━━━━━━━━━━━━━━\n\
         *Time:* `{}`",
-        w.name, old_formatted, new_formatted, ssh_info, fleet_overview, time_str
+        w.name, w.name, old_formatted, new_formatted, ssh_info, fleet_overview, time_str
     )
 }
 
@@ -778,7 +787,7 @@ pub fn format_upgrade_failed_alert(
     let time_str = Local::now().format("%Y-%m-%d %H:%M:%S");
 
     format!(
-        "⚠️ *[MUSE-HUB] Worker Auto-Update Failed*\n\
+        "⚠️ *[MUSE-HUB] Auto-Update Failed* — `{}`\n\
         ━━━━━━━━━━━━━━━━━━━━━\n\
         *Node:* `{}`\n\
         *Current Version:* `{}`\n\
@@ -789,7 +798,7 @@ pub fn format_upgrade_failed_alert(
         {}\n\
         ━━━━━━━━━━━━━��━━━━━━━\n\
         *Time:* `{}`",
-        w.name, version_str, ssh_info, error_reason, fleet_overview, time_str
+        w.name, w.name, version_str, ssh_info, error_reason, fleet_overview, time_str
     )
 }
 
