@@ -15,6 +15,7 @@ use crate::models::{
     AnthropicRequest, ChatCompletionRequest, ImageGenerationRequest, UdsMediaRequest,
     UdsMediaResponse, UdsResponse,
 };
+use crate::quota::QuotaMonitor;
 use crate::supervisor::ProcessSupervisor;
 use crate::translator::{
     convert_anthropic_to_uds, convert_openai_to_uds, extract_uds_content_text,
@@ -95,6 +96,7 @@ pub struct AppState {
     pub media_client: Arc<UdsClient>,
     pub supervisor: Arc<ProcessSupervisor>,
     pub usage: Arc<UsageStats>,
+    pub quota: Arc<QuotaMonitor>,
 }
 
 pub fn create_agent_router(state: AppState) -> Router {
@@ -221,6 +223,7 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
             },
             "update_error": state.supervisor.last_update_error(),
             "usage": state.usage.snapshot(),
+            "quota": state.quota.snapshot(),
             "ok": all_subservices_ready
         })
         .to_string(),

@@ -46,6 +46,7 @@ fn app_with_uds(socket_path: std::path::PathBuf) -> axum::Router {
             "test-vm".to_string(),
         )),
         usage: Arc::new(muse_agent::UsageStats::default()),
+        quota: muse_agent::QuotaMonitor::new("/nonexistent", std::time::Duration::from_secs(1)),
     };
     create_agent_router(state)
 }

@@ -28,6 +28,7 @@ async fn test_health_check_degraded_returns_503() {
         media_client,
         supervisor,
         usage: Arc::new(muse_agent::UsageStats::default()),
+        quota: muse_agent::QuotaMonitor::new("/nonexistent", std::time::Duration::from_secs(1)),
     };
 
     let app = create_agent_router(state);

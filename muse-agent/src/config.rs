@@ -15,6 +15,45 @@ pub struct AgentConfig {
     pub file_manager: FileManagerConfig,
     #[serde(default)]
     pub sync: SyncConfig,
+    #[serde(default)]
+    pub quota: QuotaConfig,
+}
+
+/// Where the platform reports the account's allowance. Sampling spawns the
+/// tool, so the interval is a tradeoff between freshness and process churn.
+#[derive(Debug, Deserialize, Clone)]
+pub struct QuotaConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_quota_status_bin")]
+    pub status_bin: String,
+    #[serde(default = "default_quota_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default = "default_quota_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_quota_status_bin() -> String {
+    "/opt/hatch/bin/subscription-status".to_string()
+}
+
+fn default_quota_interval_secs() -> u64 {
+    60
+}
+
+fn default_quota_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for QuotaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            status_bin: default_quota_status_bin(),
+            interval_secs: default_quota_interval_secs(),
+            timeout_secs: default_quota_timeout_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -121,6 +160,7 @@ impl AgentConfig {
             supervisor: SupervisorConfig::default(),
             file_manager: FileManagerConfig::default(),
             sync: SyncConfig::default(),
+            quota: QuotaConfig::default(),
         }
     }
 }

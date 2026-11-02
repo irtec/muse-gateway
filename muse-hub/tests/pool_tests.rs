@@ -1,4 +1,7 @@
-use muse_hub::pool::{LifecycleState, PoolOptions, SubservicesStatus};
+use muse_hub::pool::{
+    parse_reset_time, quota_skip_deadline, LifecycleState, PoolOptions, SubservicesStatus,
+    WorkerQuota,
+};
 use std::time::Instant;
 
 #[test]
@@ -218,7 +221,8 @@ fn test_alert_formatting_without_target_and_with_fleet_overview() {
         last_update_error: None,
         reported_update_error: None,
         usage: WorkerUsage::default(),
-        quota_exhausted_since: None,
+        quota: WorkerQuota::default(),
+        quota_skip_until: None,
     };
     let w2 = WorkerStatus {
         name: "VM-02 (Backup)".to_string(),
@@ -245,7 +249,8 @@ fn test_alert_formatting_without_target_and_with_fleet_overview() {
         last_update_error: None,
         reported_update_error: None,
         usage: WorkerUsage::default(),
-        quota_exhausted_since: None,
+        quota: WorkerQuota::default(),
+        quota_skip_until: None,
     };
     workers.insert(defs[0].url.clone(), w1.clone());
     workers.insert(defs[1].url.clone(), w2.clone());
@@ -253,7 +258,7 @@ fn test_alert_formatting_without_target_and_with_fleet_overview() {
     // 1. Fleet overview check
     let fleet_overview = format_fleet_overview(&defs, &workers);
     assert!(fleet_overview.contains("Cluster Fleet (1 / 2 Active - 50%):"));
-    assert!(fleet_overview.contains("• 🟢 VM-01 (Prod): Healthy (v0.1.0)"));
+    assert!(fleet_overview.contains("• 🟢 VM-01 (Prod) v0.1.0:"));
     assert!(fleet_overview.contains(
         "• 🔴 VM-02 (Backup): Offline (Connection Refused (Daemon/Tunnel Disconnected))"
     ));
@@ -271,8 +276,8 @@ fn test_alert_formatting_without_target_and_with_fleet_overview() {
         online_msg
     );
     assert!(
-        online_msg.contains("*Quota:* ✅ Credits available"),
-        "a node with no quota failure must not claim to be out of credits"
+        online_msg.contains("*Quota:* ✅ unknown"),
+        "an unsampled allowance must read as unknown, never as available"
     );
 
     // 3. Offline alert format check: NO internal Target line, includes version & fleet overview
@@ -403,7 +408,8 @@ fn test_fleet_overview_flags_quota_exhausted_node() {
                 requests: 2,
                 quota_exhausted: true,
             },
-            quota_exhausted_since: Some(Instant::now()),
+            quota: WorkerQuota::default(),
+            quota_skip_until: Some(Instant::now() + std::time::Duration::from_secs(300)),
         },
     );
 
@@ -417,5 +423,312 @@ fn test_fleet_overview_flags_quota_exhausted_node() {
         overview.contains("750 tokens / 2 reqs"),
         "the overview must show real token consumption: {}",
         overview
+    );
+}
+
+#[test]
+fn parses_platform_reset_time_and_rolls_forward() {
+    use chrono::{TimeZone, Utc};
+
+    // Reading a reset that is still ahead keeps the same year.
+    let now = Utc.with_ymd_and_hms(2026, 11, 2, 19, 0, 0).unwrap();
+    let at = parse_reset_time("Nov 4 at 12:04 AM UTC", now).expect("reset must parse");
+    assert_eq!(at, Utc.with_ymd_and_hms(2026, 11, 4, 0, 4, 0).unwrap());
+
+    // A date already behind us belongs to the next year.
+    let at = parse_reset_time("Jan 3 at 6:00 PM UTC", now).expect("reset must parse");
+    assert_eq!(at, Utc.with_ymd_and_hms(2027, 1, 3, 18, 0, 0).unwrap());
+
+    // Unparseable output must not invent a deadline.
+    assert!(parse_reset_time("soon", now).is_none());
+}
+
+#[test]
+fn quota_skip_lasts_until_the_platform_reset_time() {
+    let now = Instant::now();
+    let quota = WorkerQuota {
+        available: true,
+        subscribed: false,
+        percent_used: Some(100),
+        hit_limit: true,
+        // Well beyond the blind 5-minute window, so this proves the platform
+        // time wins over the fallback.
+        resets_at: Some("Nov 20 at 12:04 AM UTC".to_string()),
+        additional_left: None,
+        error: None,
+    };
+
+    let deadline = quota_skip_deadline(&quota, now);
+    assert!(
+        deadline.duration_since(now) > std::time::Duration::from_secs(3600),
+        "an exhausted node must stay parked past the reset, not retried every 5 minutes"
+    );
+}
+
+#[test]
+fn quota_skip_falls_back_when_no_reset_time_is_reported() {
+    let now = Instant::now();
+    let quota = WorkerQuota {
+        available: true,
+        hit_limit: true,
+        resets_at: None,
+        ..WorkerQuota::default()
+    };
+
+    let deadline = quota_skip_deadline(&quota, now);
+    assert_eq!(
+        deadline.duration_since(now),
+        std::time::Duration::from_secs(300)
+    );
+}
+
+#[test]
+fn fleet_overview_reports_the_platform_allowance() {
+    use muse_hub::config::WorkerDefinition;
+    use muse_hub::pool::{format_fleet_overview, WorkerStatus, WorkerUsage};
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    let defs = vec![
+        WorkerDefinition {
+            name: "VM-02 (Backup)".to_string(),
+            url: "http://127.0.0.1:18082".to_string(),
+            ssh_port: Some(2222),
+            file_server_port: Some(18092),
+            on_offline_hook: None,
+        },
+        WorkerDefinition {
+            name: "VM-04 (Worker)".to_string(),
+            url: "http://127.0.0.1:18084".to_string(),
+            ssh_port: Some(2224),
+            file_server_port: Some(18094),
+            on_offline_hook: None,
+        },
+    ];
+
+    let mut workers = HashMap::new();
+    workers.insert(
+        "http://127.0.0.1:18082".to_string(),
+        WorkerStatus {
+            name: "VM-02 (Backup)".to_string(),
+            url: "http://127.0.0.1:18082".to_string(),
+            ssh_port: Some(2222),
+            file_server_port: Some(18092),
+            on_offline_hook: None,
+            is_healthy: true,
+            last_checked: Instant::now(),
+            consecutive_failures: 0,
+            healthy_streak: 0,
+            announced_down: false,
+            last_alert_at: None,
+            last_pool_down_alert_at: None,
+            suppressed_alerts: 0,
+            active_requests: Arc::new(AtomicUsize::new(0)),
+            lifecycle: LifecycleState::Healthy,
+            subservices: SubservicesStatus {
+                ai_bridge: true,
+                uds_socket: true,
+                sshd: true,
+                storage: true,
+            },
+            version: Some("0.1.12".to_string()),
+            role: Some("master".to_string()),
+            last_update_error: None,
+            reported_update_error: None,
+            usage: WorkerUsage::default(),
+            quota: WorkerQuota {
+                available: true,
+                subscribed: false,
+                percent_used: Some(8),
+                hit_limit: false,
+                resets_at: Some("Nov 7 at 12:06 PM UTC".to_string()),
+                additional_left: Some("1B tokens left".to_string()),
+                error: None,
+            },
+            quota_skip_until: None,
+        },
+    );
+    workers.insert(
+        "http://127.0.0.1:18084".to_string(),
+        WorkerStatus {
+            name: "VM-04 (Worker)".to_string(),
+            url: "http://127.0.0.1:18084".to_string(),
+            ssh_port: Some(2224),
+            file_server_port: Some(18094),
+            on_offline_hook: None,
+            is_healthy: true,
+            last_checked: Instant::now(),
+            consecutive_failures: 0,
+            healthy_streak: 0,
+            announced_down: false,
+            last_alert_at: None,
+            last_pool_down_alert_at: None,
+            suppressed_alerts: 0,
+            active_requests: Arc::new(AtomicUsize::new(0)),
+            lifecycle: LifecycleState::Healthy,
+            subservices: SubservicesStatus {
+                ai_bridge: true,
+                uds_socket: true,
+                sshd: true,
+                storage: true,
+            },
+            version: Some("0.1.12".to_string()),
+            role: Some("master".to_string()),
+            last_update_error: None,
+            reported_update_error: None,
+            usage: WorkerUsage::default(),
+            quota: WorkerQuota {
+                available: true,
+                subscribed: false,
+                percent_used: Some(100),
+                hit_limit: true,
+                resets_at: Some("Nov 3 at 1:04 AM UTC".to_string()),
+                additional_left: None,
+                error: None,
+            },
+            quota_skip_until: None,
+        },
+    );
+
+    let overview = format_fleet_overview(&defs, &workers);
+    assert!(
+        overview.contains("• 🟢 VM-02 (Backup) v0.1.12: 8% used · 1B tokens left"),
+        "a healthy node must show the real allowance and its bonus balance: {}",
+        overview
+    );
+    assert!(
+        overview.contains("• 🟢 VM-04 (Worker) v0.1.12: LIMIT REACHED"),
+        "a spent allowance must be named outright: {}",
+        overview
+    );
+    assert!(
+        overview.contains("LIMIT REACHED"),
+        "a spent allowance must be named, not hidden behind a token count: {}",
+        overview
+    );
+    assert!(
+        !overview.contains("quota out"),
+        "LIMIT REACHED already names the state; a second marker is noise: {}",
+        overview
+    );
+}
+
+#[test]
+fn online_alert_reports_the_allowance_like_the_app_card() {
+    use muse_hub::config::WorkerDefinition;
+    use muse_hub::pool::{format_fleet_overview, format_online_alert, WorkerStatus, WorkerUsage};
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    let defs = vec![WorkerDefinition {
+        name: "VM-04 (Worker)".to_string(),
+        url: "http://127.0.0.1:18084".to_string(),
+        ssh_port: Some(2224),
+        file_server_port: Some(18094),
+        on_offline_hook: None,
+    }];
+    let worker = WorkerStatus {
+        name: "VM-04 (Worker)".to_string(),
+        url: "http://127.0.0.1:18084".to_string(),
+        ssh_port: Some(2224),
+        file_server_port: Some(18094),
+        on_offline_hook: None,
+        is_healthy: true,
+        last_checked: Instant::now(),
+        consecutive_failures: 0,
+        healthy_streak: 0,
+        announced_down: false,
+        last_alert_at: None,
+        last_pool_down_alert_at: None,
+        suppressed_alerts: 0,
+        active_requests: Arc::new(AtomicUsize::new(0)),
+        lifecycle: LifecycleState::Healthy,
+        subservices: SubservicesStatus {
+            ai_bridge: true,
+            uds_socket: true,
+            sshd: true,
+            storage: true,
+        },
+        version: Some("0.1.12".to_string()),
+        role: Some("master".to_string()),
+        last_update_error: None,
+        reported_update_error: None,
+        usage: WorkerUsage::default(),
+        quota: WorkerQuota {
+            available: true,
+            subscribed: false,
+            percent_used: Some(28),
+            hit_limit: false,
+            resets_at: Some("Nov 4 at 12:04 AM UTC".to_string()),
+            additional_left: Some("999M tokens left".to_string()),
+            error: None,
+        },
+        quota_skip_until: None,
+    };
+
+    let mut workers = HashMap::new();
+    workers.insert(worker.url.clone(), worker.clone());
+    let overview = format_fleet_overview(&defs, &workers);
+    let msg = format_online_alert(&worker, &overview);
+
+    assert!(
+        msg.contains("*Quota:* ✅ Free plan · 28% used · resets Nov 4 at 12:04 AM UTC · bonus 999M tokens left"),
+        "the alert must mirror the app's usage card: {}",
+        msg
+    );
+}
+
+#[test]
+fn online_alert_omits_bonus_when_the_platform_reports_none() {
+    let worker = {
+        use muse_hub::pool::{WorkerStatus, WorkerUsage};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        WorkerStatus {
+            name: "VM-01 (Prod)".to_string(),
+            url: "http://127.0.0.1:18081".to_string(),
+            ssh_port: Some(2221),
+            file_server_port: Some(18091),
+            on_offline_hook: None,
+            is_healthy: true,
+            last_checked: Instant::now(),
+            consecutive_failures: 0,
+            healthy_streak: 0,
+            announced_down: false,
+            last_alert_at: None,
+            last_pool_down_alert_at: None,
+            suppressed_alerts: 0,
+            active_requests: Arc::new(AtomicUsize::new(0)),
+            lifecycle: LifecycleState::Healthy,
+            subservices: SubservicesStatus {
+                ai_bridge: true,
+                uds_socket: true,
+                sshd: true,
+                storage: true,
+            },
+            version: Some("0.1.12".to_string()),
+            role: Some("master".to_string()),
+            last_update_error: None,
+            reported_update_error: None,
+            usage: WorkerUsage::default(),
+            quota: WorkerQuota {
+                available: true,
+                subscribed: false,
+                percent_used: Some(100),
+                hit_limit: true,
+                resets_at: Some("Nov 3 at 1:04 AM UTC".to_string()),
+                additional_left: None,
+                error: None,
+            },
+            quota_skip_until: None,
+        }
+    };
+
+    let summary = worker.quota.summary();
+    assert_eq!(
+        summary, "Free plan · LIMIT REACHED · resets Nov 3 at 1:04 AM UTC",
+        "a node with no bonus balance must not claim one"
     );
 }

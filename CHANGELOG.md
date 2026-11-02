@@ -4,6 +4,60 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning is [SemVer](https://semver.org/).
 
+## [0.1.12] - 2026-11-02
+
+The quota figures were wrong in a way that mattered: the agent counted tokens in
+memory, so every restart reset them to zero and every alert said `no traffic yet`
+even on a node that had been serving for hours. The platform does publish the
+real allowance — just not on the sockets the bridge was probing.
+
+### Fixed
+
+**Agent — real allowance**
+
+- Quota is sampled from the platform's own `subscription-status status`, which
+  reports the percent of the weekly limit consumed, the exact reset time, and any
+  purchased tokens left. Probes of `space-inference.sock` with `quota`, `usage`,
+  `status`, `limits`, `balance` and `credits` all return EOF or a connection
+  reset; `space-privileged.sock` behaves the same way.
+- Sampling runs on a timer (60s) with a 30s timeout and a cached result, so
+  `/health` never blocks on a subprocess. A failed sample reports `available:
+  false` — "unknown", never "fine".
+- `/health` carries a `quota` block alongside `usage`.
+
+**Hub — skip until the reset, not for a blind window**
+
+- A node whose allowance is spent is skipped by round-robin until the reset time
+  the platform printed, plus a 60s cushion. The previous 5-minute blind window
+  kept re-testing a known-dead account 12 times an hour.
+- The fallback window still applies when no reset time is available (older agent,
+  failed sample), so a node is never stranded out of rotation.
+- The skip is only lifted by a fresh platform sample or by the reset time passing.
+  The in-memory `usage` flag alone can no longer clear it.
+- Reset times are parsed from `<Mon> <day> at <h>:<mm> <AM|PM> UTC`; a date that
+  would land in the past rolls to the next year.
+
+**Hub — alerts**
+
+- The fleet overview and the online alert show the real allowance, worded like
+  the app's usage card: `Free plan · 28% used · resets Nov 4 · bonus 999M tokens
+  left`, instead of inferring credit state from counters that reset.
+- Bonus tokens are a top-up balance, not part of the weekly limit, so the line
+  only mentions them when the platform reports some. Without a bonus balance the
+  percentage is the whole story.
+- A spent allowance reads `LIMIT REACHED`; an unsampled one reads `unknown`.
+- Fleet lines drop the redundant `Healthy` label and carry the version inline:
+  `• 🟢 VM-02 (Backup) v0.1.12: 8% used · 1B tokens left`. Token counters are
+  only appended once the node has served traffic, so a fresh process no longer
+  prints `no traffic yet` beside a real allowance.
+
+### Added
+
+- Tests for the status parser (credits left, at limit, unrecognized output),
+  reset-time parsing including the year rollover, the skip deadline both with
+  and without a reported reset, and the alert wording with and without a bonus
+  balance. 82 tests total.
+
 ## [0.1.11] - 2026-11-02
 
 Failover is the hub's job, and quota is now a routing fact instead of a surprise.

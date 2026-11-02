@@ -38,3 +38,12 @@ sync_dir = "/home/hatch/workspace/public"
 master_url = "https://files.yourdomain.com"
 auth_token = "{{CLUSTER_TOKEN}}"
 interval_secs = 15
+
+# Account allowance sampled from the platform's own subscription tool. The
+# sandbox sockets expose no credit balance; this tool does report the weekly
+# limit, its reset time, and any purchased tokens left.
+[quota]
+enabled = true
+status_bin = "/opt/hatch/bin/subscription-status"
+interval_secs = 60
+timeout_secs = 30

@@ -186,7 +186,8 @@ async fn health_check_handler(State(state): State<AppState>) -> impl IntoRespons
                 "last_checked_secs_ago": w.last_checked_secs_ago,
                 "active_requests": w.active_requests,
                 "suppressed_alerts": w.suppressed_alerts,
-                "usage": w.usage
+                "usage": w.usage,
+                "quota": w.quota
             })
         })
         .collect();

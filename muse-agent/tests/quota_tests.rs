@@ -81,6 +81,7 @@ async fn test_quota_response_passes_through_router() {
             config.vm.id.clone(),
         )),
         usage: Arc::new(muse_agent::UsageStats::default()),
+        quota: muse_agent::QuotaMonitor::new("/nonexistent", std::time::Duration::from_secs(1)),
     };
     let app = create_agent_router(state);
 

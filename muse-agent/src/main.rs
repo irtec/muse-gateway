@@ -87,7 +87,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         media_client,
         supervisor: supervisor.clone(),
         usage: std::sync::Arc::new(muse_agent::UsageStats::default()),
+        quota: muse_agent::QuotaMonitor::new(
+            config.quota.status_bin.clone(),
+            std::time::Duration::from_secs(config.quota.timeout_secs),
+        ),
     };
+
+    if config.quota.enabled {
+        let monitor = state.quota.clone();
+        let interval = std::time::Duration::from_secs(config.quota.interval_secs.max(10));
+        tokio::spawn(async move {
+            monitor.run_loop(interval).await;
+        });
+    } else {
+        warn!("Quota sampling disabled; /health reports quota as unknown");
+    }
 
     let app = create_agent_router(state);
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;

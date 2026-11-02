@@ -90,16 +90,90 @@ pub struct WorkerStatus {
     pub last_update_error: Option<String>,
     pub reported_update_error: Option<String>,
     pub usage: WorkerUsage,
-    /// When the node last reported quota exhaustion. A node is only skipped for
-    /// `quota_retry_after`; without an expiry an exhausted node would never get
-    /// traffic again and could never prove its credits came back.
-    pub quota_exhausted_since: Option<Instant>,
+    /// Platform-reported allowance, mirrored from the agent's `/health`.
+    pub quota: WorkerQuota,
+    /// Round-robin skips this node until then. Set from the platform's own reset
+    /// time when it reports one, otherwise from a short blind window. Without an
+    /// expiry an exhausted node would never get traffic again and could never
+    /// prove its credits came back.
+    pub quota_skip_until: Option<Instant>,
 }
 
 /// How long a quota-exhausted node is skipped before it gets traffic again.
-/// Long enough to stop burning round trips, short enough that a refilled
-/// account rejoins on its own.
+/// Only used when the platform did not report a reset time; when it did, the
+/// skip lasts exactly until that moment.
 pub const QUOTA_RETRY_AFTER: Duration = Duration::from_secs(300);
+
+/// Small cushion after the advertised reset, so the first request of a new
+/// window does not race the platform's own accounting.
+const QUOTA_RESET_GRACE: Duration = Duration::from_secs(60);
+
+/// Parses the reset time the platform prints, e.g. `Nov 4 at 12:04 AM UTC`.
+///
+/// The output carries no year, so a date that would land in the past rolls
+/// forward: the next reset is always ahead of now.
+pub fn parse_reset_time(
+    text: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    // <Mon> <day> at <hour>:<min> <AM|PM> UTC
+    if parts.len() < 6 || parts[2] != "at" {
+        return None;
+    }
+
+    let month = match parts[0] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let day: u32 = parts[1].parse().ok()?;
+
+    let (hour_str, minute_str) = parts[3].split_once(':')?;
+    let mut hour: u32 = hour_str.parse().ok()?;
+    let minute: u32 = minute_str.parse().ok()?;
+    match parts[4] {
+        "AM" => {
+            if hour == 12 {
+                hour = 0;
+            }
+        }
+        "PM" => {
+            if hour != 12 {
+                hour += 12;
+            }
+        }
+        _ => return None,
+    }
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+
+    use chrono::{Datelike, TimeZone, Utc};
+    let build = |year: i32| {
+        chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .and_then(|d| d.and_hms_opt(hour, minute, 0))
+            .map(|dt| Utc.from_utc_datetime(&dt))
+    };
+
+    let mut at = build(now.year())?;
+    // A reset earlier than a day ago belongs to next year (December output read
+    // in January, or a month already passed).
+    if at < now - chrono::Duration::days(1) {
+        at = build(now.year() + 1)?;
+    }
+    Some(at)
+}
 
 #[derive(Clone, Debug)]
 pub struct PoolOptions {
@@ -135,8 +209,11 @@ pub struct WorkerSummary {
     /// node is flapping and its probe timeout or health path needs attention.
     pub suppressed_alerts: u32,
     /// Tokens this node has served since it started, plus the last known quota
-    /// state. The sandbox exposes no credit balance, so this is the real signal.
+    /// state. Counters reset when the agent restarts.
     pub usage: WorkerUsage,
+    /// Platform-reported allowance from `subscription-status`, which survives
+    /// a restart and is the only remaining-credits figure available.
+    pub quota: WorkerQuota,
 }
 
 /// Mirrors the agent's `/health` `usage` block.
@@ -165,6 +242,138 @@ impl WorkerUsage {
             format_tokens(self.total_tokens),
             self.requests
         )
+    }
+}
+
+/// Allowance reported by the platform's own subscription tool, mirrored from
+/// the agent's `/health`. Unlike the token counters this survives restarts and
+/// tells the hub how much of the weekly limit is actually spent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerQuota {
+    /// The agent managed to sample the platform tool.
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub subscribed: bool,
+    #[serde(default)]
+    pub percent_used: Option<u8>,
+    #[serde(default)]
+    pub hit_limit: bool,
+    #[serde(default)]
+    pub resets_at: Option<String>,
+    #[serde(default)]
+    pub additional_left: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl WorkerQuota {
+    /// One-line form for alerts, mirroring the app's usage card:
+    /// `Free plan · 28% used · resets Nov 4 · bonus 999M tokens left`.
+    pub fn summary(&self) -> String {
+        if !self.available {
+            return match &self.error {
+                Some(e) => format!("unknown ({})", e),
+                None => "unknown".to_string(),
+            };
+        }
+
+        let mut parts = Vec::new();
+        if !self.subscribed {
+            parts.push("Free plan".to_string());
+        }
+        if self.hit_limit {
+            parts.push("LIMIT REACHED".to_string());
+        } else if let Some(pct) = self.percent_used {
+            parts.push(format!("{}% used", pct));
+        }
+        if let Some(reset) = &self.resets_at {
+            parts.push(format!("resets {}", reset));
+        }
+        if let Some(left) = &self.additional_left {
+            parts.push(format!("bonus {}", left));
+        }
+
+        if parts.is_empty() {
+            "reported, no figures".to_string()
+        } else {
+            parts.join(" · ")
+        }
+    }
+
+    /// True only when the platform positively reports a spent allowance.
+    pub fn is_exhausted(&self) -> bool {
+        self.available && self.hit_limit
+    }
+
+    /// Short form for the fleet overview, where each node gets one line.
+    /// Bonus tokens are a top-up balance, so they only appear when the platform
+    /// reports some; the weekly percentage alone is enough otherwise.
+    pub fn short(&self) -> Option<String> {
+        if !self.available {
+            return None;
+        }
+
+        let mut parts = Vec::new();
+        if self.hit_limit {
+            parts.push("LIMIT REACHED".to_string());
+        } else if let Some(pct) = self.percent_used {
+            parts.push(format!("{}% used", pct));
+        }
+        if let Some(left) = &self.additional_left {
+            parts.push(left.clone());
+        }
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" · "))
+        }
+    }
+}
+
+/// Computes how long to route around an exhausted node.
+///
+/// The platform prints the exact moment the weekly allowance resets, so the
+/// skip lasts until then — no traffic is wasted re-testing a known-dead
+/// account, and the node rejoins by itself. Without a reset time (older agent,
+/// failed sample) fall back to a short blind window so the node is not stranded
+/// forever.
+pub fn quota_skip_deadline(quota: &WorkerQuota, now: Instant) -> Instant {
+    let from_platform = quota
+        .resets_at
+        .as_deref()
+        .and_then(|t| parse_reset_time(t, chrono::Utc::now()))
+        .map(|reset| reset + chrono::Duration::from_std(QUOTA_RESET_GRACE).unwrap_or_default());
+
+    match from_platform {
+        Some(reset) => {
+            let remaining = (reset - chrono::Utc::now()).num_seconds().max(0) as u64;
+            now + Duration::from_secs(remaining)
+        }
+        None => now + QUOTA_RETRY_AFTER,
+    }
+}
+
+impl WorkerStatus {
+    /// True while round-robin should route around this node.
+    pub fn quota_skipped_at(&self, now: Instant) -> bool {
+        self.quota_skip_until
+            .map(|until| until > now)
+            .unwrap_or(false)
+    }
+
+    /// The platform reset time in local time, for alerts.
+    pub fn quota_reset_local(&self) -> Option<String> {
+        self.quota
+            .resets_at
+            .as_deref()
+            .and_then(|t| parse_reset_time(t, chrono::Utc::now()))
+            .map(|utc| {
+                utc.with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M %Z")
+                    .to_string()
+            })
     }
 }
 
@@ -276,17 +485,23 @@ pub fn format_fleet_overview(
                         }
                     })
                     .unwrap_or_else(|| "-".to_string());
-                let quota_mark = if w.usage.quota_exhausted {
+                // `short()` already names an exhausted allowance; only add the
+                // mark when the state came from a failed inference instead.
+                let quota_mark = if !w.quota.available && w.usage.quota_exhausted {
                     " ⚠️ quota out"
                 } else {
                     ""
                 };
+                // The platform allowance is the durable figure; token counters
+                // reset with the process and only add noise before first traffic.
+                let detail = match (w.quota.short(), w.usage.requests) {
+                    (Some(q), 0) => q,
+                    (Some(q), _) => format!("{} · {}", w.usage.summary(), q),
+                    (None, _) => w.usage.summary(),
+                };
                 lines.push(format!(
-                    "• 🟢 {}: Healthy ({}) — {}{}",
-                    def.name,
-                    ver,
-                    w.usage.summary(),
-                    quota_mark
+                    "• 🟢 {} {}: {}{}",
+                    def.name, ver, detail, quota_mark
                 ));
             } else {
                 match &w.lifecycle {
@@ -391,10 +606,10 @@ pub fn format_online_alert(w: &WorkerStatus, fleet_overview: &str) -> String {
     };
     let checklist = format_subservice_checklist(&w.subservices);
     let time_str = Local::now().format("%Y-%m-%d %H:%M:%S");
-    let quota_line = if w.usage.quota_exhausted {
-        "⚠️ QUOTA EXHAUSTED (no credits left this period)"
+    let quota_line = if w.quota.is_exhausted() || w.usage.quota_exhausted {
+        format!("⚠️ QUOTA EXHAUSTED — {}", w.quota.summary())
     } else {
-        "✅ Credits available"
+        format!("✅ {}", w.quota.summary())
     };
 
     format!(
@@ -610,7 +825,8 @@ impl WorkerPool {
                     last_update_error: None,
                     reported_update_error: None,
                     usage: WorkerUsage::default(),
-                    quota_exhausted_since: None,
+                    quota: WorkerQuota::default(),
+                    quota_skip_until: None,
                 },
             );
         }
@@ -660,14 +876,10 @@ impl WorkerPool {
         // is stable and predictable rather than HashMap-random. A node whose
         // skip window has lapsed is retried: without that it could never prove
         // its account was refilled.
+        let now = Instant::now();
         let mut with_credits: Vec<WorkerStatus> = candidates
             .iter()
-            .filter(|w| {
-                !w.usage.quota_exhausted
-                    || w.quota_exhausted_since
-                        .map(|since| since.elapsed() >= QUOTA_RETRY_AFTER)
-                        .unwrap_or(true)
-            })
+            .filter(|w| !w.quota_skipped_at(now))
             .cloned()
             .collect();
         if with_credits.is_empty() {
@@ -725,16 +937,18 @@ impl WorkerPool {
 
     /// Marks a worker's upstream account as out of credits. The node stays
     /// healthy — its services are fine — but round-robin stops sending it
-    /// traffic until the retry window lapses or a probe clears the flag.
+    /// traffic until the platform's own reset time, or a probe clears the flag.
     pub async fn mark_quota_exhausted(&self, target_url: &str) {
         let mut workers = self.workers.write().await;
         if let Some(w) = workers.get_mut(target_url) {
             w.usage.quota_exhausted = true;
-            w.quota_exhausted_since = Some(Instant::now());
+            let until = quota_skip_deadline(&w.quota, Instant::now());
+            w.quota_skip_until = Some(until);
             warn!(
-                "Worker {} reported quota exhausted; skipped for {}s unless it serves again",
+                "Worker {} reported quota exhausted; skipped until {} unless it serves again",
                 w.name,
-                QUOTA_RETRY_AFTER.as_secs()
+                w.quota_reset_local()
+                    .unwrap_or_else(|| "the retry window".to_string())
             );
         }
     }
@@ -854,17 +1068,39 @@ impl WorkerPool {
                                     if let Ok(u) =
                                         serde_json::from_value::<WorkerUsage>(usage_val.clone())
                                     {
-                                        // A node that answers again has credits
-                                        // back: drop the skip so it rejoins.
-                                        if w.usage.quota_exhausted && !u.quota_exhausted {
-                                            w.quota_exhausted_since = None;
-                                        }
+                                        // The usage flag alone never lifts a
+                                        // skip: only a fresh platform sample or
+                                        // the reset time can prove credits are
+                                        // back.
                                         w.usage = u;
                                     }
                                 }
 
                                 if let Some(r) = role {
                                     w.role = Some(r);
+                                }
+
+                                // The platform allowance outlives a restart, so
+                                // it is also the only signal that survives one.
+                                // A spent allowance parks the node until the
+                                // reset time the platform itself printed.
+                                if let Some(quota_val) = parsed_val.get("quota") {
+                                    if let Ok(q) =
+                                        serde_json::from_value::<WorkerQuota>(quota_val.clone())
+                                    {
+                                        if q.is_exhausted() {
+                                            let deadline = quota_skip_deadline(&q, Instant::now());
+                                            if w.quota_skip_until
+                                                .map(|u| u < deadline)
+                                                .unwrap_or(true)
+                                            {
+                                                w.quota_skip_until = Some(deadline);
+                                            }
+                                        } else {
+                                            w.quota_skip_until = None;
+                                        }
+                                        w.quota = q;
+                                    }
                                 }
 
                                 // Check for auto-update version bump
@@ -1245,6 +1481,7 @@ impl WorkerPool {
                 last_update_error: w.last_update_error.clone(),
                 suppressed_alerts: w.suppressed_alerts,
                 usage: w.usage.clone(),
+                quota: w.quota.clone(),
             })
             .collect()
     }
