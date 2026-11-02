@@ -1,7 +1,7 @@
-serverAddr = "YOUR_EDGE_IP"
+serverAddr = "{{SERVER_ADDR}}"
 serverPort = 7000
 auth.method = "token"
-auth.token = "YOUR_FRP_SECRET_TOKEN"
+auth.token = "{{FRP_TOKEN}}"
 log.to = "/home/hatch/workspace/agent/logs/frpc.log"
 log.level = "info"
 log.maxDays = 3
@@ -20,10 +20,10 @@ localIP = "127.0.0.1"
 localPort = 11436
 remotePort = {{AI_PORT}}
 
+# Direct TCP tunnel used by the hub's active-standby file server router.
 [[proxies]]
 name = "file-server-{{VM_ID}}"
 type = "tcp"
 localIP = "127.0.0.1"
 localPort = 8080
 remotePort = {{FILE_SERVER_PORT}}
-

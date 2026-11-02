@@ -29,13 +29,16 @@ frpc_config = "/home/hatch/workspace/agent/config/frpc.toml"
 
 [file_manager]
 # Native Axum file server powering files.yourdomain.com
+# auth_user/auth_salt/auth_hash MUST be byte-identical on every worker: failover
+# logs the same user in against whichever node answers. Placeholder (all-zero)
+# values cannot accept any password and report storage=false.
 enabled = true
 host = "127.0.0.1"
 port = 8080
 root_dir = "/home/hatch/workspace/public"
-auth_user = "admin"
-auth_salt = "00000000000000000000000000000000"
-auth_hash = "0000000000000000000000000000000000000000000000000000000000000000"
+auth_user = "YOUR_AUTH_USER"
+auth_salt = "YOUR_AUTH_SALT"
+auth_hash = "YOUR_AUTH_HASH"
 
 [sync]
 # In-Agent One-Way Sync Engine (Master VM-01 <-> Worker Replica)

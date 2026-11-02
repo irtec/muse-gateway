@@ -102,10 +102,18 @@ Each worker node runs `muse-agent` alongside `frpc` to bridge AI inference, SSH,
 #### Automated One-Line Installation (Recommended)
 Run inside the target worker VM:
 ```bash
-VM_ID=vm2 curl -fsSL -u admin:YOUR_PASSWORD https://files.yourdomain.com/files/muse-agent-installer/install.sh | bash
+curl -fsSL -u admin:YOUR_PASSWORD https://files.yourdomain.com/files/muse-agent-installer/install.sh | \
+  VM_ID=vm2 \
+  CLUSTER_TOKEN="YOUR_CLUSTER_SECRET_TOKEN" \
+  EDGE_HOST="YOUR_EDGE_IP" \
+  FRP_TOKEN="YOUR_FRP_SECRET_TOKEN" \
+  FILE_SERVER_USER="YOUR_AUTH_USER" \
+  FILE_SERVER_SALT="YOUR_AUTH_SALT" \
+  FILE_SERVER_HASH="YOUR_AUTH_HASH" \
+  bash
 ```
 
-*Note: The script automatically calculates port assignments based on `VM_ID` (SSH: `2220+N`, AI: `18080+N`, File Server: `18090+N`). For detailed manual steps, see [`deploy/vm-bootstrap/INSTALLER_README.md`](./deploy/vm-bootstrap/INSTALLER_README.md).*
+*Note: The variables go after the pipe (`| VAR=value bash`). `VM_ID=vm2 curl ... | bash` only exports `VM_ID` to `curl`, so the script would see an empty `VM_ID`. The script derives ports from `VM_ID` (SSH: `2220+N`, AI: `18080+N`, File Server: `18090+N`) and aborts if any credential above is missing, because a placeholder node looks healthy but cannot authenticate or tunnel. For detailed manual steps, see [`deploy/vm-bootstrap/INSTALLER_README.md`](./deploy/vm-bootstrap/INSTALLER_README.md).*
 
 ### 3. Cluster Credentials & File Manager Authentication
 
@@ -120,5 +128,6 @@ To maintain a secure and consistent cluster, certain configuration values **must
   python3 -c 'import hashlib, secrets; p="YOUR_PASSWORD"; s=secrets.token_hex(16); h=hashlib.pbkdf2_hmac("sha256", p.encode(), bytes.fromhex(s), 200000, 32).hex(); print(f"auth_salt = \"{s}\"\nauth_hash = \"{h}\"")'
   ```
   **Critical:** Copy the exact same `auth_salt` and `auth_hash` values to `[file_manager]` in `muse-agent.toml` on **all worker VMs** (VM-01, VM-02, VM-03, etc.). Because the hub provides transparent Active-Standby failover between workers, having identical credentials guarantees that user logins, downloads, and automation scripts continue without session authentication errors during failover.
+  Leaving a node on the shipped placeholder (`auth_salt`/`auth_hash` of all zeros) makes that node unable to accept **any** password: PBKDF2 never produces an all-zero key, so every login is rejected with `401`. Such a node now reports `storage: false` in `/health` and the hub refuses to fail over to it, so the failure surfaces as "no storage node available" instead of a misleading login error on a node that looks healthy.
 
 

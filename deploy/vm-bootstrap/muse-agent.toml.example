@@ -1,6 +1,6 @@
 [vm]
 id = "{{VM_ID}}"
-token = "YOUR_CLUSTER_SECRET_TOKEN"
+token = "{{CLUSTER_TOKEN}}"
 
 [server]
 host = "127.0.0.1"
@@ -18,21 +18,23 @@ base_dir = "/home/hatch/workspace/agent"
 frpc_bin = "/home/hatch/workspace/agent/bin/frpc"
 frpc_config = "/home/hatch/workspace/agent/config/frpc.toml"
 
-# Active-Standby File Server: Enabled so the worker is prepared for failover file serving
+# Active-standby file server. auth_user/auth_salt/auth_hash MUST be byte-identical
+# on every worker: failover logs the same user in against whichever node answers.
+# Placeholder (all-zero) values cannot accept any password and report storage=false.
 [file_manager]
 enabled = true
 host = "127.0.0.1"
 port = 8080
 root_dir = "/home/hatch/workspace/public"
-auth_user = "admin"
-auth_salt = "00000000000000000000000000000000"
-auth_hash = "0000000000000000000000000000000000000000000000000000000000000000"
+auth_user = "{{AUTH_USER}}"
+auth_salt = "{{AUTH_SALT}}"
+auth_hash = "{{AUTH_HASH}}"
 
-# Sync Engine: Worker operates as a read-only replica backup of Master VM-01
+# Sync engine: VM-01 is the master, every other node mirrors it as a replica.
 [sync]
 enabled = true
-role = "replica"
+role = "{{SYNC_ROLE}}"
 sync_dir = "/home/hatch/workspace/public"
 master_url = "https://files.yourdomain.com"
-auth_token = "YOUR_CLUSTER_SECRET_TOKEN"
+auth_token = "{{CLUSTER_TOKEN}}"
 interval_secs = 15

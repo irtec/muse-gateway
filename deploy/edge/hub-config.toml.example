@@ -29,6 +29,10 @@ targets = [
 # Periodic health check interval per worker (seconds)
 health_check_interval_secs = 5
 
+# Per-probe /health timeout (seconds). Keep this above the worker's worst-case
+# health latency, or a busy-but-healthy node gets reported as offline.
+health_check_timeout_secs = 10
+
 # Maximum timeout per AI request before triggering failover (seconds)
 request_timeout_secs = 120
 

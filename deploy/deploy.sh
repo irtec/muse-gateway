@@ -38,23 +38,45 @@ echo "=== [2/4] Verifying built artifacts ==="
 ls -lh "${HUB_BIN}" "${AGENT_BIN}"
 
 echo "=== [3/4] Deploying muse-hub to Edge Gateway (${EDGE_HOST}) ==="
+if [ "${EDGE_HOST}" = "YOUR_EDGE_IP" ]; then
+    echo "ERROR: EDGE_HOST is unset. Run with: EDGE_HOST=<edge-ip> EDGE_PORT=<ssh-port> $0"
+    exit 1
+fi
 ssh -p "${EDGE_PORT}" "${EDGE_USER}@${EDGE_HOST}" "sudo mkdir -p /etc/muse-hub"
 
 # Copy binary & service
 scp -P "${EDGE_PORT}" "${HUB_BIN}" "${EDGE_USER}@${EDGE_HOST}:/tmp/muse-hub"
-ssh -p "${EDGE_PORT}" "${EDGE_USER}@${EDGE_HOST}" "sudo mv /tmp/muse-hub /usr/local/bin/muse-hub && sudo chmod +x /usr/local/bin/muse-hub"
+# Write to a new inode then rename: overwriting the running binary in place fails
+# with "Text file busy" when /tmp and /usr/local/bin are separate filesystems.
+ssh -p "${EDGE_PORT}" "${EDGE_USER}@${EDGE_HOST}" "sudo install -m 0755 /tmp/muse-hub /usr/local/bin/muse-hub.new && sudo mv -f /usr/local/bin/muse-hub.new /usr/local/bin/muse-hub && rm -f /tmp/muse-hub"
 
 scp -P "${EDGE_PORT}" "${SCRIPT_DIR}/edge/muse-hub.service" "${EDGE_USER}@${EDGE_HOST}:/tmp/muse-hub.service"
 ssh -p "${EDGE_PORT}" "${EDGE_USER}@${EDGE_HOST}" "sudo mv /tmp/muse-hub.service /etc/systemd/system/muse-hub.service && sudo systemctl daemon-reload"
 
-# Copy example config if not exists
-ssh -p "${EDGE_PORT}" "${EDGE_USER}@${EDGE_HOST}" "if [ ! -f /etc/muse-hub/config.toml ]; then echo 'Copying default config...'; sudo cp /tmp/hub-config.toml /etc/muse-hub/config.toml 2>/dev/null || true; fi"
+# Seed the config from the example only on a first install; an existing config is
+# never touched. The example still carries placeholders, so a fresh edge box is
+# reported as not restarted instead of being started with a placeholder token.
+scp -P "${EDGE_PORT}" "${SCRIPT_DIR}/edge/hub-config.toml.example" "${EDGE_USER}@${EDGE_HOST}:/tmp/hub-config.toml.example"
+if ssh -p "${EDGE_PORT}" "${EDGE_USER}@${EDGE_HOST}" "test -f /etc/muse-hub/config.toml"; then
+    ssh -p "${EDGE_PORT}" "${EDGE_USER}@${EDGE_HOST}" "sudo systemctl restart muse-hub.service && sudo systemctl enable muse-hub.service"
+    echo "✔ muse-hub.service restarted on ${EDGE_HOST}"
+else
+    ssh -p "${EDGE_PORT}" "${EDGE_USER}@${EDGE_HOST}" "sudo install -m 0640 /tmp/hub-config.toml.example /etc/muse-hub/config.toml"
+    echo "⚠ First install: /etc/muse-hub/config.toml seeded from the example and NOT started."
+    echo "  Fill in pool workers, telegram token and frps ports, then run:"
+    echo "    ssh -p ${EDGE_PORT} ${EDGE_USER}@${EDGE_HOST} 'sudo systemctl enable --now muse-hub.service'"
+fi
 
 echo "=== [4/4] Packaging muse-agent for VM workspace distribution ==="
 mkdir -p "${SCRIPT_DIR}/dist"
 cp "${AGENT_BIN}" "${SCRIPT_DIR}/dist/muse-agent"
 cp "${SCRIPT_DIR}/vm-bootstrap/bootstrap.sh" "${SCRIPT_DIR}/dist/bootstrap.sh"
+cp "${SCRIPT_DIR}/vm-bootstrap/install.sh" "${SCRIPT_DIR}/dist/install.sh"
+cp "${SCRIPT_DIR}/vm-bootstrap/muse-agent.toml.example" "${SCRIPT_DIR}/dist/muse-agent.toml.example"
+cp "${SCRIPT_DIR}/vm-bootstrap/frpc.toml.example" "${SCRIPT_DIR}/dist/frpc.toml.example"
 
 echo "Artifacts ready in: ${SCRIPT_DIR}/dist/"
-echo "Upload ${SCRIPT_DIR}/dist/* directly to VM persistent storage (/home/hatch/workspace/agent/) via SSH or deployment automation."
+echo "Publish these to the VM-01 installer mirror (public/files/muse-agent-installer/);"
+echo "replicas pick them up through the sync engine. The mirror copy of muse-agent is"
+echo "what every worker auto-updates from, so publish it on VM-01 only."
 echo "Done!"
