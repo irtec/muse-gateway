@@ -57,11 +57,13 @@ The project is structured into 3 core crates:
 ### 3. [`muse-agent`](./muse-agent/README.md)
 *All-in-one native worker binary (deployed inside each sandbox VM).*
 - **HTTP-to-UDS AI Bridge (`:11436`):** Translates standard OpenAI and Anthropic REST payloads directly into Hatch Unix Domain Sockets (`space-inference.sock` & `space-media.sock`).
-- **Process Supervisor:** Manages the lifecycle of the `frpc` reverse tunnel with automatic crash respawn.
+- **Process Supervisor:** Manages the lifecycle of the `frpc` reverse tunnel with automatic crash respawn. It adopts an `frpc` already started by `run.sh` rather than spawning a duplicate, reaps its own child so no zombie is left behind, and refreshes `run.sh` from the installer mirror when its hash differs.
 - **SSH Self-Healing:** Ensures the OpenSSH server (`:22`) remains active and injects authorized SSH keys persistently across container resets.
 - **Native Sync Engine:** Autonomous one-way file synchronization from the Master node (VM-01) to replica workers.
 - **Atomic Auto-Update:** Autonomous rolling updates without downtime; detects new binary releases synced to the local storage, validates SHA-256 integrity, performs an atomic filesystem swap, and cleanly hands off restart to systemd or the platform watchdog.
-- **File Manager (`:8080`):** Secure, PBKDF2-authenticated file server (serves as Active Primary on Master VM-01 and Standby Failover on Replicas).
+- **File Manager (`:8080`):** Secure, PBKDF2-authenticated file server (serves as Active Primary on Master VM-01 and Standby Failover on Replicas). `auth_salt`/`auth_hash` must be byte-identical on every worker; a node on placeholder credentials reports `storage: false` and is never used as a failover target.
+
+See [`CHANGELOG.md`](./CHANGELOG.md) for release history.
 
 ---
 
