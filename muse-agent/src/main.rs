@@ -109,6 +109,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Start File Manager if enabled in configuration
     if config.file_manager.enabled {
+        if config.file_manager.has_placeholder_credentials() {
+            tracing::error!(
+                "File manager has placeholder credentials (auth_salt/auth_hash). It will bind, but no login can succeed and /health reports storage as down. Set the same auth_salt/auth_hash as the other workers."
+            );
+        }
         let mut fm_config = config.file_manager.clone();
         if fm_config.auth_token.is_none() {
             fm_config.auth_token = Some(config.vm.token.clone());

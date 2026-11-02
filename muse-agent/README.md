@@ -11,6 +11,8 @@ All-in-One Native Rust Worker Node Daemon & Service Supervisor.
 1. **HTTP-to-UDS AI Bridge (`:11436`):**
    - Ingests standard OpenAI requests (`/v1/chat/completions`, SSE streaming, tool calls, multi-modal vision inputs) and Anthropic payloads (`/v1/messages`).
    - Translates incoming REST calls directly into Hatch Unix Domain Socket binary wire protocol (4-byte Big-Endian Length Prefix + JSON) over `/run/hatch/sandbox/space-inference.sock` and `/run/hatch/sandbox/space-media.sock` (for `/v1/images/generations`).
+   - `/health` bounds its UDS liveness ping at 2 seconds and reports the socket as ready when the ping times out, so a model busy with inference is never mistaken for a dead node.
+   - **Quota exhaustion is reported as quota, not as a fault.** When the model's account runs out of credits, the bridge answers `429` with `x-muse-error: insufficient_quota` and a message stating that every service on the node is running normally. The hub uses that header to fail over without ever marking the node unhealthy.
 
 2. **Process Supervisor & Tunnel Manager:**
    - Supervises the lifecycle of the `frpc` reverse proxy tunnel connected to the Edge Gateway (`:7000`).
@@ -23,6 +25,8 @@ All-in-One Native Rust Worker Node Daemon & Service Supervisor.
 4. **Native One-Way File Sync Engine:**
    - Executes as an asynchronous Tokio task (`role = "replica"`) to pull file delta updates from the master node (VM-01) into `~/workspace/public/`.
    - Leverages sub-millisecond `X-Cluster-Version` digest comparisons and atomic writes (`.tmp` staging followed by atomic rename) to avoid serving partial reads.
+   - The version digest is only recorded once every file in the delta landed intact, so a failed download is retried on the next cycle instead of wedging the replica on a stale binary forever. Failed staging files are deleted, never accumulated.
+   - Loopback (`localhost`, `127.0.0.1`, `::1`) always bypasses the egress proxy, together with any `NO_PROXY` entries the operator sets.
 
 5. **Atomic Auto-Update Service:**
    - Continuously monitors `~/workspace/public/files/muse-agent-installer/muse-agent` for newer binary releases propagated across the fleet via the file sync engine.
@@ -30,7 +34,7 @@ All-in-One Native Rust Worker Node Daemon & Service Supervisor.
    - Safely stages updates to a temporary sibling file (`agent/bin/muse-agent.update.<uuid>`), sets executable permissions (`0755`), re-checks the SHA-256 digest, and performs an atomic filesystem swap (`std::fs::rename`).
    - Terminates gracefully (`exit(0)`) after a 500 ms log flush window, letting systemd (`Restart=always`) or the platform supervisor watchdog (`run.sh`) immediately restart the updated daemon with zero cluster downtime.
 
-*(Note: The agent also includes the **Axum File Manager (`:8080`)**, which serves as Active Primary on Master VM-01 and Standby Failover on Replicas for `files.yourdomain.com`)*.
+*(Note: The agent also includes the **Axum File Manager (`:8080`)**, which serves as Active Primary on Master VM-01 and Standby Failover on Replicas for `files.yourdomain.com`. Its `auth_salt`/`auth_hash` must be identical on every worker, since failover authenticates the same user against whichever node answers. A node left on the placeholder credentials accepts no password at all and reports `storage: false`, so the hub skips it.)*.
 
 ---
 
@@ -65,9 +69,9 @@ enabled = true
 host = "127.0.0.1"
 port = 8080
 root_dir = "/home/hatch/workspace/public"
-auth_user = "admin"
-auth_salt = "00000000000000000000000000000000"
-auth_hash = "0000000000000000000000000000000000000000000000000000000000000000"
+auth_user = "YOUR_AUTH_USER"
+auth_salt = "YOUR_AUTH_SALT"
+auth_hash = "YOUR_AUTH_HASH"
 
 [sync]
 enabled = true

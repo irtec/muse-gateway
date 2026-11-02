@@ -72,6 +72,16 @@ pub struct WorkerStatus {
     pub is_healthy: bool,
     pub last_checked: Instant,
     pub consecutive_failures: usize,
+    /// Consecutive probes with every subservice ready; gates recovery alerts.
+    pub healthy_streak: usize,
+    /// True once an outage alert reached Telegram, so recovery alerts only
+    /// fire when an outage was actually announced.
+    pub announced_down: bool,
+    pub last_alert_at: Option<Instant>,
+    /// Separate bucket so a full-pool outage is never silenced by the per-node
+    /// cooldown, yet still cannot repeat faster than one alert per window.
+    pub last_pool_down_alert_at: Option<Instant>,
+    pub suppressed_alerts: u32,
     pub active_requests: Arc<AtomicUsize>,
     pub lifecycle: LifecycleState,
     pub subservices: SubservicesStatus,
@@ -79,6 +89,23 @@ pub struct WorkerStatus {
     pub role: Option<String>,
     pub last_update_error: Option<String>,
     pub reported_update_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PoolOptions {
+    /// Per-probe `/health` timeout.
+    pub health_timeout: Duration,
+    /// Minimum gap between Telegram alerts for the same worker.
+    pub alert_cooldown: Duration,
+}
+
+impl Default for PoolOptions {
+    fn default() -> Self {
+        Self {
+            health_timeout: Duration::from_secs(10),
+            alert_cooldown: Duration::from_secs(300),
+        }
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -94,6 +121,9 @@ pub struct WorkerSummary {
     pub version: Option<String>,
     pub role: Option<String>,
     pub last_update_error: Option<String>,
+    /// Availability alerts held back by the cooldown; a high count means the
+    /// node is flapping and its probe timeout or health path needs attention.
+    pub suppressed_alerts: u32,
 }
 
 pub struct WorkerPool {
@@ -102,6 +132,7 @@ pub struct WorkerPool {
     round_robin_counter: AtomicUsize,
     telegram: TelegramNotifier,
     client: reqwest::Client,
+    options: PoolOptions,
 }
 
 pub fn clean_error_reason(err: &str) -> String {
@@ -112,7 +143,7 @@ pub fn clean_error_reason(err: &str) -> String {
     {
         "Connection Refused (Daemon/Tunnel Disconnected)".to_string()
     } else if lower.contains("timed out") || lower.contains("timeout") {
-        "Timeout / Unresponsive (>3s)".to_string()
+        "Timeout / Unresponsive".to_string()
     } else if lower.contains("dns") || lower.contains("resolve") {
         "Network / DNS Resolution Failed".to_string()
     } else if lower.contains("connection reset") {
@@ -469,7 +500,11 @@ pub fn format_upgrade_failed_alert(
 }
 
 impl WorkerPool {
-    pub fn new(definitions: Vec<WorkerDefinition>, telegram: TelegramNotifier) -> Self {
+    pub fn new(
+        definitions: Vec<WorkerDefinition>,
+        telegram: TelegramNotifier,
+        options: PoolOptions,
+    ) -> Self {
         let mut map = HashMap::new();
         for def in &definitions {
             map.insert(
@@ -483,6 +518,11 @@ impl WorkerPool {
                     is_healthy: true, // assume healthy initially until check
                     last_checked: Instant::now(),
                     consecutive_failures: 0,
+                    healthy_streak: 0,
+                    announced_down: false,
+                    last_alert_at: None,
+                    last_pool_down_alert_at: None,
+                    suppressed_alerts: 0,
                     active_requests: Arc::new(AtomicUsize::new(0)),
                     lifecycle: LifecycleState::Healthy,
                     subservices: SubservicesStatus::default(),
@@ -495,7 +535,7 @@ impl WorkerPool {
         }
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(3))
+            .timeout(options.health_timeout)
             .build()
             .unwrap_or_default();
 
@@ -505,6 +545,7 @@ impl WorkerPool {
             round_robin_counter: AtomicUsize::new(0),
             telegram,
             client,
+            options,
         }
     }
 
@@ -542,8 +583,11 @@ impl WorkerPool {
             }
         }
 
-        // 2. If no workers have storage specifically ready, fallback to any healthy worker
-        if candidates.is_empty() {
+        // 2. Nothing reported storage ready. Fall back to healthy workers only when
+        // no worker advertised storage at all: a node that explicitly reports
+        // storage down (placeholder credentials, unbound port) must never be a
+        // failover target, or the request lands where no login can succeed.
+        if candidates.is_empty() && !workers.values().any(|w| w.subservices.storage) {
             for def in &self.definitions {
                 if let Some(w) = workers.get(&def.url) {
                     if let Some(port) = w.file_server_port {
@@ -566,6 +610,7 @@ impl WorkerPool {
         if let Some(w) = workers.get_mut(target_url) {
             w.is_healthy = false;
             w.consecutive_failures += 1;
+            w.healthy_streak = 0;
 
             match &w.lifecycle {
                 LifecycleState::Healthy | LifecycleState::Recovering { .. } => {
@@ -594,7 +639,8 @@ impl WorkerPool {
     /// Periodic health check across all target workers
     pub async fn run_health_checks(&self) {
         const MAX_GRACE_WINDOW_SECS: u64 = 300; // 5-minute maximum grace window to wait for subservices to become ready
-        const DOWN_CONFIRM_FAILURES: usize = 2; // Require at least 2 consecutive failures to confirm Down state
+        const DOWN_CONFIRM_FAILURES: usize = 3; // Consecutive failed probes before declaring a node down
+        const RECOVERY_CONFIRM_PROBES: usize = 3; // Consecutive clean probes before declaring it healthy again
 
         for def in &self.definitions {
             let target = &def.url;
@@ -705,34 +751,42 @@ impl WorkerPool {
                                 w.is_healthy = subservices.ai_bridge && subservices.uds_socket;
 
                                 let all_ready = subservices.all_ready();
+                                // Recovery needs a stable streak, otherwise a single lucky
+                                // probe flips the node back and forth on every flap.
+                                w.healthy_streak = if all_ready { w.healthy_streak + 1 } else { 0 };
+                                let recovered =
+                                    all_ready && w.healthy_streak >= RECOVERY_CONFIRM_PROBES;
 
                                 match &w.lifecycle {
                                     LifecycleState::DownConfirmed { .. }
                                     | LifecycleState::DownPending { .. } => {
-                                        if all_ready {
-                                            // Immediately mark 100% UP without waiting for grace period
+                                        if recovered {
                                             w.lifecycle = LifecycleState::Healthy;
-                                            if !upgraded {
+                                            // Only announce recovery when the outage was announced.
+                                            if !upgraded && w.announced_down {
+                                                w.announced_down = false;
                                                 alert_actions.push(AlertAction::Online(w.clone()));
                                             }
                                         } else {
-                                            // Subservices still pending (e.g. UDS/SSH/Sync), start grace window timer
+                                            // Responding but not yet stable: wait out the grace window.
                                             w.lifecycle = LifecycleState::Recovering {
                                                 first_seen_ok: Instant::now(),
                                                 last_details: subservices,
                                             };
-                                            info!(
-                                                "Worker {} ({}) responding but subservices incomplete. Starting 5m grace window.",
-                                                w.name, target
-                                            );
+                                            if !all_ready {
+                                                info!(
+                                                    "Worker {} ({}) responding but subservices incomplete. Starting 5m grace window.",
+                                                    w.name, target
+                                                );
+                                            }
                                         }
                                     }
                                     LifecycleState::Recovering { first_seen_ok, .. } => {
                                         let elapsed = first_seen_ok.elapsed().as_secs();
-                                        if all_ready {
-                                            // All subservices ready before grace window expired -> send UP immediately!
+                                        if recovered {
                                             w.lifecycle = LifecycleState::Healthy;
-                                            if !upgraded {
+                                            if !upgraded && w.announced_down {
+                                                w.announced_down = false;
                                                 alert_actions.push(AlertAction::Online(w.clone()));
                                             }
                                         } else if elapsed >= MAX_GRACE_WINDOW_SECS {
@@ -757,9 +811,10 @@ impl WorkerPool {
                                         alert_sent,
                                         ..
                                     } => {
-                                        if all_ready {
+                                        if recovered {
                                             w.lifecycle = LifecycleState::Healthy;
-                                            if !upgraded {
+                                            if !upgraded && w.announced_down {
+                                                w.announced_down = false;
                                                 alert_actions.push(AlertAction::Online(w.clone()));
                                             }
                                         } else {
@@ -783,6 +838,7 @@ impl WorkerPool {
                             } else {
                                 let status_code = status.as_u16();
                                 w.consecutive_failures += 1;
+                                w.healthy_streak = 0;
                                 w.is_healthy = false;
 
                                 match &w.lifecycle {
@@ -820,6 +876,7 @@ impl WorkerPool {
                         Err(e) => {
                             let err_str = describe_error(&e);
                             w.consecutive_failures += 1;
+                            w.healthy_streak = 0;
                             w.is_healthy = false;
 
                             match &w.lifecycle {
@@ -888,8 +945,64 @@ impl WorkerPool {
                 let workers = self.workers.read().await;
                 let fleet_overview = format_fleet_overview(&self.definitions, &workers);
                 let healthy_count = workers.values().filter(|w| w.is_healthy).count();
+                drop(workers);
+
+                // Cooldown damps repeated outage alerts for the same worker. Recovery
+                // alerts always go out, so the chat never keeps a stale OFFLINE message.
+                // A pool-wide outage uses its own bucket so it can never be silenced.
+                let outage_allowed = {
+                    let mut workers = self.workers.write().await;
+                    match workers.get_mut(target) {
+                        Some(w) => {
+                            let has_outage = alert_actions.iter().any(|a| {
+                                matches!(
+                                    a,
+                                    AlertAction::Offline(..)
+                                        | AlertAction::Degraded(..)
+                                        | AlertAction::HttpDegraded(..)
+                                )
+                            });
+                            if !has_outage {
+                                true
+                            } else {
+                                let bucket = if healthy_count == 0 {
+                                    &mut w.last_pool_down_alert_at
+                                } else {
+                                    &mut w.last_alert_at
+                                };
+                                let within_cooldown = bucket
+                                    .is_some_and(|at| at.elapsed() < self.options.alert_cooldown);
+                                if within_cooldown {
+                                    w.suppressed_alerts += 1;
+                                    false
+                                } else {
+                                    *bucket = Some(Instant::now());
+                                    true
+                                }
+                            }
+                        }
+                        None => true,
+                    }
+                };
 
                 for action in alert_actions {
+                    let is_outage = matches!(
+                        action,
+                        AlertAction::Offline(..)
+                            | AlertAction::Degraded(..)
+                            | AlertAction::HttpDegraded(..)
+                    );
+                    if is_outage && !outage_allowed {
+                        warn!(
+                            "Outage alert for {} suppressed (cooldown {}s)",
+                            target,
+                            self.options.alert_cooldown.as_secs()
+                        );
+                        continue;
+                    }
+                    // Only a delivered outage marks the node as announced, so a
+                    // suppressed outage never yields an orphan "recovered" message.
+                    let outage_announced = is_outage;
                     let text = match action {
                         AlertAction::Online(w_info) => {
                             info!(
@@ -945,10 +1058,20 @@ impl WorkerPool {
                             format_upgrade_failed_alert(&w_info, &err_str, &fleet_overview)
                         }
                     };
+                    if outage_announced {
+                        if let Some(w) = self.workers.write().await.get_mut(target) {
+                            w.announced_down = true;
+                        }
+                    }
                     self.telegram.send_alert(&text).await;
                 }
             }
         }
+    }
+
+    /// Total alerts delivered since startup; surfaced by the hub `/health` endpoint.
+    pub fn alerts_emitted(&self) -> usize {
+        self.telegram.emitted_count()
     }
 
     /// Returns list of workers and their status for /health API
@@ -968,6 +1091,7 @@ impl WorkerPool {
                 version: w.version.clone(),
                 role: w.role.clone(),
                 last_update_error: w.last_update_error.clone(),
+                suppressed_alerts: w.suppressed_alerts,
             })
             .collect()
     }

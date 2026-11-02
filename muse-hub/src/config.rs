@@ -41,6 +41,10 @@ pub struct PoolConfig {
     pub workers: Vec<WorkerDefinition>, // Explicit structured workers
     #[serde(default = "default_health_check_interval_secs")]
     pub health_check_interval_secs: u64,
+    /// Per-probe timeout for `/health`. Must exceed worst-case worker health
+    /// latency, otherwise a busy-but-healthy node is reported offline.
+    #[serde(default = "default_health_check_timeout_secs")]
+    pub health_check_timeout_secs: u64,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
 }
@@ -85,6 +89,10 @@ fn default_health_check_interval_secs() -> u64 {
     5
 }
 
+fn default_health_check_timeout_secs() -> u64 {
+    10
+}
+
 fn default_request_timeout_secs() -> u64 {
     120
 }
@@ -120,6 +128,7 @@ impl HubConfig {
                 ],
                 workers: vec![],
                 health_check_interval_secs: 5,
+                health_check_timeout_secs: 10,
                 request_timeout_secs: 120,
             },
             telegram: Some(TelegramConfig {

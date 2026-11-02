@@ -1,4 +1,6 @@
 use reqwest::Client;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -8,6 +10,9 @@ pub struct TelegramNotifier {
     bot_token: String,
     chat_id: String,
     enabled: bool,
+    /// Alerts that passed pool-side suppression and were handed to the notifier;
+    /// lets tests measure alert volume without a live Telegram bot.
+    emitted: Arc<AtomicUsize>,
 }
 
 impl TelegramNotifier {
@@ -22,6 +27,7 @@ impl TelegramNotifier {
             bot_token,
             chat_id,
             enabled,
+            emitted: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -31,11 +37,19 @@ impl TelegramNotifier {
             bot_token: String::new(),
             chat_id: String::new(),
             enabled: false,
+            emitted: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Alerts that passed pool-side suppression since startup.
+    pub fn emitted_count(&self) -> usize {
+        self.emitted.load(Ordering::Relaxed)
     }
 
     /// Sends a formatted Markdown message to Telegram channel/group
     pub async fn send_alert(&self, text: &str) {
+        self.emitted.fetch_add(1, Ordering::Relaxed);
+
         if !self.enabled || self.bot_token.is_empty() || self.chat_id.is_empty() {
             info!("[Telegram Alert Skipped]: {}", text);
             return;

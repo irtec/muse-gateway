@@ -5,7 +5,7 @@ mod telegram;
 
 use config::HubConfig;
 use lb::{create_file_server_router, create_router, AppState};
-use pool::WorkerPool;
+use pool::{PoolOptions, WorkerPool};
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,7 +52,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         TelegramNotifier::disabled()
     };
 
-    let pool = Arc::new(WorkerPool::new(config.pool.resolved_workers(), telegram));
+    let pool = Arc::new(WorkerPool::new(
+        config.pool.resolved_workers(),
+        telegram,
+        PoolOptions {
+            health_timeout: Duration::from_secs(config.pool.health_check_timeout_secs),
+            ..PoolOptions::default()
+        },
+    ));
 
     // Periodic Health Check Loop for all target workers
     let pool_checker = pool.clone();

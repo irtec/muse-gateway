@@ -67,4 +67,13 @@ impl FileManagerConfig {
     pub fn root_path(&self) -> PathBuf {
         PathBuf::from(&self.root_dir)
     }
+
+    /// True when the credentials are still the shipped placeholders. Such a node
+    /// cannot serve a login that works on the other workers, so the hub must not
+    /// route file traffic to it.
+    pub fn has_placeholder_credentials(&self) -> bool {
+        let zero_salt = self.auth_salt.chars().all(|c| c == '0');
+        let zero_hash = self.auth_hash.chars().all(|c| c == '0');
+        self.auth_salt.is_empty() || self.auth_hash.is_empty() || zero_salt || zero_hash
+    }
 }

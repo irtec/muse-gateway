@@ -8,6 +8,7 @@ async fn test_hub_health_and_models_endpoints() {
     let pool = Arc::new(WorkerPool::new(
         hub_config.pool.resolved_workers(),
         muse_hub::telegram::TelegramNotifier::disabled(),
+        muse_hub::pool::PoolOptions::default(),
     ));
 
     let app = create_router(AppState {

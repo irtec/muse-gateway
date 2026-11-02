@@ -23,6 +23,70 @@ use crate::translator::{
 };
 use crate::uds::UdsClient;
 
+/// Upper bound for the UDS liveness ping issued by `/health`.
+const HEALTH_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Response header marking an upstream quota exhaustion, so the hub can fail
+/// over to a node that still has credits instead of treating it as a fault.
+pub const QUOTA_EXHAUSTED_HEADER: &str = "x-muse-error";
+pub const QUOTA_EXHAUSTED_VALUE: &str = "insufficient_quota";
+
+/// Upstream quota exhaustion is a billing state, not a fault: the node is
+/// healthy and still serving, it simply has no credits left this period.
+pub fn is_quota_exhausted(err_msg: &str) -> bool {
+    let lower = err_msg.to_lowercase();
+    lower.contains("quota")
+        || lower.contains("credits")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+}
+
+/// Builds the quota-exhausted response. Wording is deliberate: it must not read
+/// as an outage, or operators start debugging a node that is working fine.
+pub fn quota_exhausted_response(
+    vm_id: &str,
+    upstream_msg: &str,
+    anthropic_style: bool,
+) -> Response {
+    let message = format!(
+        "Model quota exhausted on {} — every service on this node is running normally; \
+         the upstream account has no credits left for this billing period. \
+         Upstream said: {}",
+        vm_id, upstream_msg
+    );
+
+    let body = if anthropic_style {
+        json!({
+            "type": "error",
+            "error": {
+                "type": "insufficient_quota",
+                "message": message
+            }
+        })
+    } else {
+        json!({
+            "error": {
+                "type": "insufficient_quota",
+                "code": "insufficient_quota",
+                "message": message
+            }
+        })
+    };
+
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (
+                axum::http::header::HeaderName::from_static(QUOTA_EXHAUSTED_HEADER),
+                QUOTA_EXHAUSTED_VALUE,
+            ),
+        ],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: AgentConfig,
@@ -82,12 +146,27 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> bool {
 }
 
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let uds_ready = match state.uds_client.send_request(b"{\"ping\":true}").await {
-        Ok(_) => true,
-        Err(e) => {
+    // A busy model queues the ping behind inference, so an unbounded wait here
+    // makes a healthy node look dead to the hub. Bound it and treat a timeout
+    // as "socket alive but busy" rather than "socket down".
+    let uds_ready = match tokio::time::timeout(
+        HEALTH_PING_TIMEOUT,
+        state.uds_client.send_request(b"{\"ping\":true}"),
+    )
+    .await
+    {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
             let err_str = e.to_string();
             !err_str.contains("Connection refused")
                 && !err_str.contains("No such file or directory")
+        }
+        Err(_) => {
+            tracing::warn!(
+                "UDS ping exceeded {:?}; reporting socket as ready (model busy)",
+                HEALTH_PING_TIMEOUT
+            );
+            true
         }
     };
 
@@ -98,12 +177,16 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     let sshd_ready = tokio::net::TcpStream::connect("127.0.0.1:22").await.is_ok();
 
     // Subservice 3: Storage / File Service check
-    // If master: check local port 8080 (file manager)
-    // If replica: check sync status
+    // A file manager that still runs on placeholder credentials cannot serve a
+    // login that works on the other workers, so it must not count as ready.
+    let file_manager_auth = state.config.file_manager.enabled
+        && !state.config.file_manager.has_placeholder_credentials();
     let storage_ready = if state.config.file_manager.enabled {
-        tokio::net::TcpStream::connect(format!("127.0.0.1:{}", state.config.file_manager.port))
-            .await
-            .is_ok()
+        let listening =
+            tokio::net::TcpStream::connect(format!("127.0.0.1:{}", state.config.file_manager.port))
+                .await
+                .is_ok();
+        listening && file_manager_auth
     } else if state.config.sync.enabled {
         // Replica sync check: verify sync_dir exists
         std::path::Path::new(&state.config.sync.sync_dir).exists()
@@ -231,6 +314,9 @@ async fn openai_chat_completions(
                         "OpenAI req_id={}: UDS returned ok=false, error={}",
                         uds_req.request_id, err_msg
                     );
+                    if is_quota_exhausted(err_msg) {
+                        return quota_exhausted_response(&state.config.vm.id, err_msg, false);
+                    }
                     return (
                         StatusCode::UNPROCESSABLE_ENTITY,
                         [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -486,6 +572,13 @@ async fn anthropic_messages(
                                 "Anthropic req_id={}: UDS returned ok=false, error={}",
                                 req_id_label, err_msg
                             );
+                            if is_quota_exhausted(err_msg) {
+                                return quota_exhausted_response(
+                                    &state.config.vm.id,
+                                    err_msg,
+                                    true,
+                                );
+                            }
                             return (
                                 StatusCode::UNPROCESSABLE_ENTITY,
                                 [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -893,7 +986,22 @@ async fn internal_sync_manifest(State(state): State<AppState>, headers: HeaderMa
     }
 
     let root_path = std::path::Path::new(&state.config.sync.sync_dir);
-    match crate::sync::generate_manifest(root_path) {
+    let root_owned = root_path.to_path_buf();
+    // Hashing a large tree must not block the tokio workers that serve `/health`.
+    let manifest_res =
+        tokio::task::spawn_blocking(move || crate::sync::generate_manifest(&root_owned)).await;
+    let manifest_res = match manifest_res {
+        Ok(res) => res,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                json!({ "error": format!("Manifest task failed: {}", e) }).to_string(),
+            )
+                .into_response();
+        }
+    };
+    match manifest_res {
         Ok(manifest) => {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -1009,7 +1117,23 @@ pub async fn internal_sync_manifest_fm(
     }
 
     let root_path = state.config.root_path();
-    match crate::sync::generate_manifest(&root_path) {
+    // The file-manager handler lives on the same runtime as the AI bridge; hashing
+    // a multi-GB tree inline would stall `/health` on port 11436.
+    let root_owned = root_path.clone();
+    let manifest_res =
+        tokio::task::spawn_blocking(move || crate::sync::generate_manifest(&root_owned)).await;
+    let manifest_res = match manifest_res {
+        Ok(res) => res,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                json!({ "error": format!("Manifest task failed: {}", e) }).to_string(),
+            )
+                .into_response();
+        }
+    };
+    match manifest_res {
         Ok(manifest) => {
             let mut headers = HeaderMap::new();
             headers.insert(

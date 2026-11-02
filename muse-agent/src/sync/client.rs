@@ -9,6 +9,26 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tracing::{error, info, warn};
 
+/// Hosts that must bypass the egress proxy: the replica's own loopback and any
+/// NO_PROXY the operator set. Without this, a loopback master URL is proxied out
+/// through the sandbox and the download dies.
+fn sync_no_proxy() -> Option<reqwest::NoProxy> {
+    let mut entries = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    if let Ok(raw) = std::env::var("NO_PROXY").or_else(|_| std::env::var("no_proxy")) {
+        entries.extend(
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        );
+    }
+    reqwest::NoProxy::from_string(&entries.join(","))
+}
+
 pub struct SyncClient {
     config: SyncConfig,
     auth_token: String,
@@ -26,6 +46,10 @@ impl SyncClient {
 
         let mut proxy_applied = false;
 
+        // Loopback must never go through the egress proxy; reqwest's `Proxy::all`
+        // ignores NO_PROXY unless told explicitly.
+        let no_proxy = sync_no_proxy();
+
         // 1. Prioritize explicit [egress] settings from config toml
         if let Some(ref eg) = egress {
             if eg.enabled {
@@ -36,7 +60,7 @@ impl SyncClient {
                             proxy = proxy.basic_auth(user, pass);
                         }
                     }
-                    builder = builder.proxy(proxy);
+                    builder = builder.proxy(proxy.no_proxy(no_proxy.clone()));
                     proxy_applied = true;
                     info!("Sync: using configured egress proxy {}", proxy_url);
                 }
@@ -49,7 +73,7 @@ impl SyncClient {
                 std::env::var("https_proxy").or_else(|_| std::env::var("HTTPS_PROXY"))
             {
                 if let Ok(proxy) = reqwest::Proxy::all(&proxy_str) {
-                    builder = builder.proxy(proxy);
+                    builder = builder.proxy(proxy.no_proxy(no_proxy.clone()));
                     proxy_applied = true;
                     info!("Sync: using env https_proxy {}", proxy_str);
                 }
@@ -57,7 +81,7 @@ impl SyncClient {
                 std::env::var("http_proxy").or_else(|_| std::env::var("HTTP_PROXY"))
             {
                 if let Ok(proxy) = reqwest::Proxy::all(&proxy_str) {
-                    builder = builder.proxy(proxy);
+                    builder = builder.proxy(proxy.no_proxy(no_proxy.clone()));
                     proxy_applied = true;
                     info!("Sync: using env http_proxy {}", proxy_str);
                 }
@@ -69,7 +93,7 @@ impl SyncClient {
         if !proxy_applied {
             let default_hatch_proxy = "http://hatch-egress-proxy:3128";
             if let Ok(proxy) = reqwest::Proxy::all(default_hatch_proxy) {
-                builder = builder.proxy(proxy);
+                builder = builder.proxy(proxy.no_proxy(no_proxy));
                 info!(
                     "Sync: using default sandbox egress proxy {}",
                     default_hatch_proxy
@@ -165,6 +189,7 @@ impl SyncClient {
         }
 
         // 4. Download new or modified files
+        let mut failed_downloads = 0usize;
         for f in files_to_download {
             info!(
                 "Sync: downloading updated file '{}' ({} bytes)",
@@ -172,6 +197,7 @@ impl SyncClient {
             );
             if let Err(e) = self.download_file(&f.rel_path, &f.sha256).await {
                 error!("Sync: failed to download '{}': {}", f.rel_path, e);
+                failed_downloads += 1;
             }
         }
 
@@ -185,10 +211,18 @@ impl SyncClient {
             }
         }
 
-        // 6. Update cached version hash
-        {
+        // 6. Only record the version hash once the tree actually matches the
+        // master. Recording it after a failed download makes the fast path
+        // short-circuit every later cycle, so the replica never retries and
+        // stays stuck on the old binary forever.
+        if failed_downloads == 0 {
             let mut last_v = self.last_version_hash.write().await;
             *last_v = Some(remote_manifest.version_hash);
+        } else {
+            warn!(
+                "Sync: {} file(s) failed to download; keeping previous version hash so the next cycle retries",
+                failed_downloads
+            );
         }
 
         Ok(())
@@ -231,25 +265,33 @@ impl SyncClient {
             return Err(format!("Master download returned HTTP {}", resp.status()).into());
         }
 
-        let mut file = fs::File::create(&tmp_path).await?;
-        let bytes = resp.bytes().await?;
-        file.write_all(&bytes).await?;
-        file.flush().await?;
-        drop(file);
+        let staged: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+            let mut file = fs::File::create(&tmp_path).await?;
+            let bytes = resp.bytes().await?;
+            file.write_all(&bytes).await?;
+            file.flush().await?;
+            drop(file);
 
-        // Validate SHA-256 hash of temporary file
-        let downloaded_sha = compute_sha256(&tmp_path)?;
-        if downloaded_sha != expected_sha256 {
-            let _ = fs::remove_file(&tmp_path).await;
-            return Err(format!(
-                "Hash mismatch for '{}': expected {}, got {}",
-                rel_path, expected_sha256, downloaded_sha
-            )
-            .into());
+            // Validate SHA-256 hash of temporary file
+            let downloaded_sha = compute_sha256(&tmp_path)?;
+            if downloaded_sha != expected_sha256 {
+                return Err(format!(
+                    "Hash mismatch for '{}': expected {}, got {}",
+                    rel_path, expected_sha256, downloaded_sha
+                )
+                .into());
+            }
+
+            // Atomic rename to final target file path
+            fs::rename(&tmp_path, &target_path).await?;
+            Ok(())
         }
+        .await;
 
-        // Atomic rename to final target file path
-        fs::rename(&tmp_path, &target_path).await?;
-        Ok(())
+        // A retry loop runs every cycle, so a leftover .tmp would pile up forever.
+        if staged.is_err() {
+            let _ = fs::remove_file(&tmp_path).await;
+        }
+        staged
     }
 }

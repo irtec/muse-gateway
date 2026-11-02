@@ -1,4 +1,4 @@
-use muse_hub::pool::{LifecycleState, SubservicesStatus};
+use muse_hub::pool::{LifecycleState, PoolOptions, SubservicesStatus};
 use std::time::Instant;
 
 #[test]
@@ -74,7 +74,7 @@ async fn test_active_standby_file_server_selection() {
         },
     ];
 
-    let pool = WorkerPool::new(defs, TelegramNotifier::disabled());
+    let pool = WorkerPool::new(defs, TelegramNotifier::disabled(), PoolOptions::default());
 
     // 1. Initial state: both nodes healthy, selected primary must be VM-01 (port 18091)
     let candidates = pool.select_file_server_candidates().await;
@@ -118,7 +118,7 @@ fn test_clean_error_reason() {
     );
     assert_eq!(
         clean_error_reason("connection error: connection timed out"),
-        "Timeout / Unresponsive (>3s)"
+        "Timeout / Unresponsive"
     );
     assert_eq!(
         clean_error_reason(
@@ -200,6 +200,11 @@ fn test_alert_formatting_without_target_and_with_fleet_overview() {
         is_healthy: true,
         last_checked: Instant::now(),
         consecutive_failures: 0,
+        healthy_streak: 3,
+        announced_down: false,
+        last_alert_at: None,
+        last_pool_down_alert_at: None,
+        suppressed_alerts: 0,
         active_requests: Arc::new(AtomicUsize::new(0)),
         lifecycle: LifecycleState::Healthy,
         subservices: SubservicesStatus {
@@ -222,6 +227,11 @@ fn test_alert_formatting_without_target_and_with_fleet_overview() {
         is_healthy: false,
         last_checked: Instant::now(),
         consecutive_failures: 2,
+        healthy_streak: 0,
+        announced_down: true,
+        last_alert_at: None,
+        last_pool_down_alert_at: None,
+        suppressed_alerts: 0,
         active_requests: Arc::new(AtomicUsize::new(0)),
         lifecycle: LifecycleState::DownConfirmed {
             since: Instant::now(),
@@ -290,7 +300,7 @@ async fn test_pool_list_workers_status_summary() {
         on_offline_hook: None,
     }];
 
-    let pool = WorkerPool::new(defs, TelegramNotifier::disabled());
+    let pool = WorkerPool::new(defs, TelegramNotifier::disabled(), PoolOptions::default());
     let summaries = pool.list_workers_status().await;
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].name, "VM-01 (Prod)");

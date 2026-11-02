@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 use tracing::warn;
 
@@ -61,6 +63,45 @@ pub fn generate_manifest(root_dir: &Path) -> std::io::Result<Manifest> {
     })
 }
 
+/// Hash cache keyed by path, valid while size and mtime are unchanged.
+/// The sync tree is ~2 GB, so re-hashing every file on every manifest request
+/// starves the async runtime and makes `/health` look unresponsive.
+static HASH_CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, CachedHash>>> =
+    std::sync::OnceLock::new();
+
+struct CachedHash {
+    size: u64,
+    mtime: u64,
+    sha256: String,
+}
+
+fn cached_sha256(path: &Path, size: u64, mtime: u64) -> std::io::Result<String> {
+    let cache = HASH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Ok(guard) = cache.lock() {
+        if let Some(hit) = guard.get(path) {
+            if hit.size == size && hit.mtime == mtime {
+                return Ok(hit.sha256.clone());
+            }
+        }
+    }
+
+    let sha256 = compute_sha256(path)?;
+
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(
+            path.to_path_buf(),
+            CachedHash {
+                size,
+                mtime,
+                sha256: sha256.clone(),
+            },
+        );
+    }
+
+    Ok(sha256)
+}
+
 fn scan_dir_recursive(
     current: &Path,
     root: &Path,
@@ -100,7 +141,7 @@ fn scan_dir_recursive(
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
 
-            let sha256 = match compute_sha256(&path) {
+            let sha256 = match cached_sha256(&path, size, mtime) {
                 Ok(h) => h,
                 Err(e) => {
                     warn!("Failed to compute sha256 for {:?}: {}", path, e);

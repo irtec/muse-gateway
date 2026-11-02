@@ -14,6 +14,14 @@ use tracing::{info, warn};
 use crate::config::HubConfig;
 use crate::pool::WorkerPool;
 
+/// A quota-exhausted upstream reply, kept so the client still learns the cause
+/// when every healthy node is out of credits.
+struct QuotaReply {
+    status: StatusCode,
+    headers: Vec<(HeaderName, HeaderValue)>,
+    body: Bytes,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<HubConfig>,
@@ -163,7 +171,8 @@ async fn health_check_handler(State(state): State<AppState>) -> impl IntoRespons
                 "role": w.role,
                 "last_update_error": w.last_update_error,
                 "last_checked_secs_ago": w.last_checked_secs_ago,
-                "active_requests": w.active_requests
+                "active_requests": w.active_requests,
+                "suppressed_alerts": w.suppressed_alerts
             })
         })
         .collect();
@@ -179,6 +188,7 @@ async fn health_check_handler(State(state): State<AppState>) -> impl IntoRespons
         "service": "muse-hub",
         "healthy_workers": healthy_count,
         "total_workers": details.len(),
+        "alerts_emitted": state.pool.alerts_emitted(),
         "workers": details,
     }))
 }
@@ -228,6 +238,7 @@ async fn forward_inference_handler(
     let path = uri.path();
     let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
     let max_retries = 3;
+    let mut quota_reply: Option<QuotaReply> = None;
 
     for attempt in 1..=max_retries {
         let worker = match state.pool.select_worker().await {
@@ -275,6 +286,44 @@ async fn forward_inference_handler(
         match resp_res {
             Ok(resp) => {
                 let status = resp.status();
+
+                // Quota exhaustion is a billing state, not a fault. Fail over to a
+                // node that still has credits, but never mark this one unhealthy —
+                // its services are running fine.
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    let exhausted = resp
+                        .headers()
+                        .get("x-muse-error")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| v == "insufficient_quota")
+                        .unwrap_or(false);
+                    if exhausted {
+                        warn!(
+                            "Worker {} reported quota exhausted. Failing over; node stays healthy.",
+                            worker.url
+                        );
+                        // Keep the first quota answer as the fallback reply, so the
+                        // client still learns why nothing was generated.
+                        if quota_reply.is_none() {
+                            let mut headers = Vec::new();
+                            if let Some(ct) = resp.headers().get("content-type") {
+                                headers.push((HeaderName::from_static("content-type"), ct.clone()));
+                            }
+                            if let Some(me) = resp.headers().get("x-muse-error") {
+                                headers.push((HeaderName::from_static("x-muse-error"), me.clone()));
+                            }
+                            if let Ok(bytes) = resp.bytes().await {
+                                quota_reply = Some(QuotaReply {
+                                    status,
+                                    headers,
+                                    body: bytes,
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                }
+
                 if status.is_server_error() {
                     warn!(
                         "Worker {} returned HTTP {} server error. Triggering auto-failover...",
@@ -336,6 +385,20 @@ async fn forward_inference_handler(
                 continue;
             }
         }
+    }
+
+    // Every healthy node was out of credits: answer with the quota explanation
+    // rather than a misleading gateway failure.
+    if let Some(reply) = quota_reply {
+        let mut builder = Response::builder().status(reply.status);
+        for (name, value) in reply.headers {
+            builder = builder.header(name, value);
+        }
+        return builder
+            .body(axum::body::Body::from(reply.body))
+            .unwrap_or_else(|_| {
+                (StatusCode::BAD_GATEWAY, "Upstream quota exhausted").into_response()
+            });
     }
 
     (
