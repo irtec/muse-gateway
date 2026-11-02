@@ -22,6 +22,7 @@ use crate::translator::{
     format_uds_to_openai_stream, normalize_tool_choice, parse_tool_calls,
 };
 use crate::uds::UdsClient;
+use crate::usage::UsageStats;
 
 /// Upper bound for the UDS liveness ping issued by `/health`.
 const HEALTH_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -93,6 +94,7 @@ pub struct AppState {
     pub uds_client: Arc<UdsClient>,
     pub media_client: Arc<UdsClient>,
     pub supervisor: Arc<ProcessSupervisor>,
+    pub usage: Arc<UsageStats>,
 }
 
 pub fn create_agent_router(state: AppState) -> Router {
@@ -218,6 +220,7 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
                 "storage": storage_ready
             },
             "update_error": state.supervisor.last_update_error(),
+            "usage": state.usage.snapshot(),
             "ok": all_subservices_ready
         })
         .to_string(),
@@ -300,180 +303,282 @@ async fn openai_chat_completions(
         state.config.vm.id, uds_req.request_id
     );
 
-    match state.uds_client.send_request(&uds_bytes).await {
-        Ok(resp_bytes) => match serde_json::from_slice::<UdsResponse>(&resp_bytes) {
-            Ok(uds_resp) => {
-                // Check if UDS returned an error
-                if !uds_resp.ok {
-                    let err_msg = uds_resp
-                        .error
-                        .as_ref()
-                        .and_then(|e| e.as_str())
-                        .unwrap_or("inference_failed");
-                    error!(
-                        "OpenAI req_id={}: UDS returned ok=false, error={}",
-                        uds_req.request_id, err_msg
-                    );
-                    if is_quota_exhausted(err_msg) {
-                        return quota_exhausted_response(&state.config.vm.id, err_msg, false);
-                    }
-                    return (
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                        json!({
-                            "error": {
-                                "message": format!("Upstream inference error: {}", err_msg),
-                                "type": "upstream_error",
-                                "code": 422
-                            }
-                        })
-                        .to_string(),
-                    )
-                        .into_response();
-                }
-
-                let (raw_text, _, _, _) = extract_uds_content_text(&uds_resp);
-                let (mut is_tool, mut tool_calls, mut clean_text) =
-                    if payload.tools.is_some() || payload.functions.is_some() {
-                        parse_tool_calls(&raw_text)
-                    } else {
-                        (false, Vec::new(), Some(raw_text))
-                    };
-
-                // Tool retry nudge loop if tools are required or forced
-                let (tc_mode, forced_name) = normalize_tool_choice(
-                    payload
-                        .tool_choice
-                        .as_ref()
-                        .or(payload.function_call.as_ref()),
-                );
-                let need_tool = tc_mode == "required" || tc_mode == "forced";
-
-                let mut current_uds_resp = uds_resp;
-
-                if (payload.tools.is_some() || payload.functions.is_some()) && need_tool {
-                    let mut tool_satisfied = if tc_mode == "forced" && forced_name.is_some() {
-                        let fname = forced_name.as_deref().unwrap_or_default();
-                        is_tool && tool_calls.iter().any(|c| c.function.name == fname)
-                    } else {
-                        is_tool
-                    };
-
-                    let mut attempt = 1;
-                    let max_tool_retries = 3;
-
-                    while !tool_satisfied && attempt < max_tool_retries {
-                        attempt += 1;
-                        let nudge = "\n\nIMPORTANT: Your previous reply did not contain a tool call. You MUST respond with ONLY the JSON tool call object, nothing else.";
-                        let mut retry_req = uds_req.clone();
-                        let new_sys = match &retry_req.system {
-                            Some(s) => format!("{}{}", s, nudge),
-                            None => nudge.trim_start().to_string(),
-                        };
-                        retry_req.system = Some(new_sys);
-                        retry_req.request_id = format!("gw-retry-{}", uuid::Uuid::new_v4());
-
-                        if let Ok(retry_bytes) = serde_json::to_vec(&retry_req) {
-                            if let Ok(retry_resp_bytes) =
-                                state.uds_client.send_request(&retry_bytes).await
-                            {
-                                if let Ok(retry_uds_resp) =
-                                    serde_json::from_slice::<UdsResponse>(&retry_resp_bytes)
-                                {
-                                    let (retry_raw, _, _, _) =
-                                        extract_uds_content_text(&retry_uds_resp);
-                                    let (r_is_tool, r_calls, r_clean) =
-                                        parse_tool_calls(&retry_raw);
-                                    is_tool = r_is_tool;
-                                    tool_calls = r_calls;
-                                    clean_text = r_clean;
-                                    current_uds_resp = retry_uds_resp;
-
-                                    tool_satisfied = if tc_mode == "forced" && forced_name.is_some()
-                                    {
-                                        let fname = forced_name.as_deref().unwrap_or_default();
-                                        is_tool
-                                            && tool_calls.iter().any(|c| c.function.name == fname)
-                                    } else {
-                                        is_tool
-                                    };
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if payload.stream == Some(true) {
-                    let sse_str = format_uds_to_openai_stream(
-                        &current_uds_resp,
-                        model_req.as_deref(),
-                        is_tool,
-                        &tool_calls,
-                        clean_text.as_deref(),
-                    );
-                    (
-                        StatusCode::OK,
-                        [
-                            (
-                                axum::http::header::CONTENT_TYPE.as_str(),
-                                "text/event-stream; charset=utf-8",
-                            ),
-                            (
-                                axum::http::header::CACHE_CONTROL.as_str(),
-                                "no-cache, no-transform",
-                            ),
-                            (axum::http::header::CONNECTION.as_str(), "keep-alive"),
-                            ("x-accel-buffering", "no"),
-                        ],
-                        sse_str,
-                    )
-                        .into_response()
-                } else {
-                    let openai_resp = format_uds_to_openai(
-                        &current_uds_resp,
-                        model_req.as_deref(),
-                        is_tool,
-                        &tool_calls,
-                        clean_text.as_deref(),
-                    );
-                    (
-                        StatusCode::OK,
-                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                        serde_json::to_string(&openai_resp).unwrap_or_default(),
-                    )
-                        .into_response()
-                }
-            }
+    // Retry a transient sandbox failure ("Web artifact inference failed.") before
+    // surfacing it. One blip must not become a 422 the hub treats as final.
+    let mut attempt: u32 = 0;
+    let (_resp_bytes, uds_resp) = loop {
+        attempt += 1;
+        let bytes = match state.uds_client.send_request(&uds_bytes).await {
+            Ok(b) => b,
             Err(e) => {
-                error!("Failed to parse UDS response: {}", e);
-                (
+                error!(
+                    "OpenAI req_id={}: UDS socket error: {}",
+                    uds_req.request_id, e
+                );
+                return (
                     StatusCode::BAD_GATEWAY,
                     [(axum::http::header::CONTENT_TYPE, "application/json")],
                     json!({
                         "error": {
-                            "message": format!("Invalid response from inference UDS: {}", e),
+                            "message": format!("UDS inference socket error: {}", e),
                             "type": "upstream_error",
                             "code": 502
                         }
                     })
                     .to_string(),
                 )
-                    .into_response()
+                    .into_response();
             }
-        },
-        Err(e) => {
-            error!("UDS inference error: {}", e);
-            (
+        };
+        match serde_json::from_slice::<UdsResponse>(&bytes) {
+            Ok(r) => {
+                if r.ok
+                    || is_quota_exhausted(
+                        r.error
+                            .as_ref()
+                            .and_then(|e| e.as_str())
+                            .unwrap_or_default(),
+                    )
+                {
+                    break (bytes, r);
+                }
+                let msg = r
+                    .error
+                    .as_ref()
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("inference_failed")
+                    .to_string();
+                if attempt <= 2 {
+                    error!(
+                        "OpenAI req_id={}: UDS returned ok=false ({}), retrying ({}/2)",
+                        uds_req.request_id, msg, attempt
+                    );
+                    continue;
+                }
+                error!(
+                    "OpenAI req_id={}: UDS returned ok=false after {} attempts, error={}",
+                    uds_req.request_id, attempt, msg
+                );
+                // A sandbox-side inference failure is transient infrastructure,
+                // not a malformed request: 5xx lets the hub fail over.
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    json!({
+                        "error": {
+                            "message": format!("Upstream inference error: {}", msg),
+                            "type": "upstream_error",
+                            "code": 502
+                        }
+                    })
+                    .to_string(),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                error!("Failed to parse UDS response: {}", e);
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    json!({
+                        "error": {
+                            "message": format!("Failed to parse inference response: {}", e),
+                            "type": "upstream_error",
+                            "code": 502
+                        }
+                    })
+                    .to_string(),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    {
+        if !uds_resp.ok {
+            let err_msg = uds_resp
+                .error
+                .as_ref()
+                .and_then(|e| e.as_str())
+                .unwrap_or("inference_failed");
+            if is_quota_exhausted(err_msg) {
+                state.usage.mark_quota_exhausted(true);
+            }
+            return quota_exhausted_response(&state.config.vm.id, err_msg, false);
+        }
+
+        let (raw_text, _, _, _) = extract_uds_content_text(&uds_resp);
+        // A real answer means credits are back; the sticky flag can clear.
+        state.usage.mark_quota_exhausted(false);
+        let has_tools = payload.tools.is_some() || payload.functions.is_some();
+        let (mut is_tool, mut tool_calls, mut clean_text) = if has_tools {
+            parse_tool_calls(&raw_text)
+        } else {
+            (false, Vec::new(), Some(raw_text.clone()))
+        };
+
+        // Tool retry nudge loop if tools are required or forced
+        let (tc_mode, forced_name) = normalize_tool_choice(
+            payload
+                .tool_choice
+                .as_ref()
+                .or(payload.function_call.as_ref()),
+        );
+        let need_tool = tc_mode == "required" || tc_mode == "forced";
+
+        let mut current_uds_resp = uds_resp;
+
+        // Empty content with tools usually means the sandbox executed a
+        // native function call we cannot see. Retry: the directive in the
+        // system prompt steers the model to plain-text tool calls instead.
+        let mut empty_attempt: u32 = 0;
+        while raw_text.trim().is_empty() && has_tools && empty_attempt < 2 && !need_tool {
+            empty_attempt += 1;
+            let mut retry_req = uds_req.clone();
+            retry_req.request_id =
+                format!("gw-{}-empty-retry-{}", uds_req.request_id, empty_attempt);
+            let Ok(retry_bytes) = serde_json::to_vec(&retry_req) else {
+                break;
+            };
+            let Ok(retry_resp_bytes) = state.uds_client.send_request(&retry_bytes).await else {
+                break;
+            };
+            let Ok(retry_uds_resp) = serde_json::from_slice::<UdsResponse>(&retry_resp_bytes)
+            else {
+                break;
+            };
+            let (retry_raw, _, _, _) = extract_uds_content_text(&retry_uds_resp);
+            if !retry_raw.trim().is_empty() {
+                let (r_is_tool, r_calls, r_clean) = parse_tool_calls(&retry_raw);
+                is_tool = r_is_tool;
+                tool_calls = r_calls;
+                clean_text = r_clean;
+                current_uds_resp = retry_uds_resp;
+                break;
+            }
+            current_uds_resp = retry_uds_resp;
+        }
+
+        if has_tools && need_tool {
+            let mut tool_satisfied = if tc_mode == "forced" && forced_name.is_some() {
+                let fname = forced_name.as_deref().unwrap_or_default();
+                is_tool && tool_calls.iter().any(|c| c.function.name == fname)
+            } else {
+                is_tool
+            };
+
+            let mut attempt = 1;
+            let max_tool_retries = 3;
+
+            while !tool_satisfied && attempt < max_tool_retries {
+                attempt += 1;
+                let nudge = "\n\nIMPORTANT: Your previous reply did not contain a tool call. You MUST respond with ONLY the JSON tool call object, nothing else.";
+                let mut retry_req = uds_req.clone();
+                let new_sys = match &retry_req.system {
+                    Some(s) => format!("{}{}", s, nudge),
+                    None => nudge.trim_start().to_string(),
+                };
+                retry_req.system = Some(new_sys);
+                retry_req.request_id = format!("gw-retry-{}", uuid::Uuid::new_v4());
+
+                if let Ok(retry_bytes) = serde_json::to_vec(&retry_req) {
+                    if let Ok(retry_resp_bytes) = state.uds_client.send_request(&retry_bytes).await
+                    {
+                        if let Ok(retry_uds_resp) =
+                            serde_json::from_slice::<UdsResponse>(&retry_resp_bytes)
+                        {
+                            let (retry_raw, _, _, _) = extract_uds_content_text(&retry_uds_resp);
+                            let (r_is_tool, r_calls, r_clean) = parse_tool_calls(&retry_raw);
+                            is_tool = r_is_tool;
+                            tool_calls = r_calls;
+                            clean_text = r_clean;
+                            current_uds_resp = retry_uds_resp;
+
+                            tool_satisfied = if tc_mode == "forced" && forced_name.is_some() {
+                                let fname = forced_name.as_deref().unwrap_or_default();
+                                is_tool && tool_calls.iter().any(|c| c.function.name == fname)
+                            } else {
+                                is_tool
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        // Nothing usable came back: no tool call and no text. An empty 200
+        // stalls the client forever, so surface it as a failover-able 5xx.
+        let effective_text = clean_text.as_deref().unwrap_or(raw_text.as_str());
+        if has_tools && !is_tool && effective_text.trim().is_empty() {
+            error!(
+                "OpenAI req_id={}: empty content and no tool call after retries, output_tokens={}",
+                uds_req.request_id,
+                current_uds_resp
+                    .result
+                    .as_ref()
+                    .and_then(|r| r.usage.as_ref())
+                    .map(|u| u.output_tokens)
+                    .unwrap_or(0)
+            );
+            return (
                 StatusCode::BAD_GATEWAY,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
                 json!({
                     "error": {
-                        "message": format!("UDS inference socket error: {}", e),
+                        "message": "Model returned empty content for tool calling request",
                         "type": "upstream_error",
                         "code": 502
                     }
                 })
                 .to_string(),
+            )
+                .into_response();
+        }
+
+        // Record the tokens this turn actually consumed, whichever response
+        // shape follows. A retried turn only counts the response that is used.
+        {
+            let (_, in_tokens, out_tokens, _) = extract_uds_content_text(&current_uds_resp);
+            state.usage.record(in_tokens, out_tokens);
+        }
+
+        if payload.stream == Some(true) {
+            let sse_str = format_uds_to_openai_stream(
+                &current_uds_resp,
+                model_req.as_deref(),
+                is_tool,
+                &tool_calls,
+                clean_text.as_deref(),
+            );
+            (
+                StatusCode::OK,
+                [
+                    (
+                        axum::http::header::CONTENT_TYPE.as_str(),
+                        "text/event-stream; charset=utf-8",
+                    ),
+                    (
+                        axum::http::header::CACHE_CONTROL.as_str(),
+                        "no-cache, no-transform",
+                    ),
+                    (axum::http::header::CONNECTION.as_str(), "keep-alive"),
+                    ("x-accel-buffering", "no"),
+                ],
+                sse_str,
+            )
+                .into_response()
+        } else {
+            let openai_resp = format_uds_to_openai(
+                &current_uds_resp,
+                model_req.as_deref(),
+                is_tool,
+                &tool_calls,
+                clean_text.as_deref(),
+            );
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&openai_resp).unwrap_or_default(),
             )
                 .into_response()
         }
@@ -573,14 +678,20 @@ async fn anthropic_messages(
                                 req_id_label, err_msg
                             );
                             if is_quota_exhausted(err_msg) {
+                                state.usage.mark_quota_exhausted(true);
                                 return quota_exhausted_response(
                                     &state.config.vm.id,
                                     err_msg,
                                     true,
                                 );
                             }
+                            if uds_attempt <= max_empty_retries {
+                                continue;
+                            }
+                            // Transient sandbox failure, not a malformed request:
+                            // 5xx lets the hub fail over instead of ending the turn.
                             return (
-                                StatusCode::UNPROCESSABLE_ENTITY,
+                                StatusCode::BAD_GATEWAY,
                                 [(axum::http::header::CONTENT_TYPE, "application/json")],
                                 json!({
                                     "type": "error",
@@ -626,7 +737,7 @@ async fn anthropic_messages(
                                     .unwrap_or("")
                             );
                             return (
-                                StatusCode::UNPROCESSABLE_ENTITY,
+                                StatusCode::BAD_GATEWAY,
                                 [(axum::http::header::CONTENT_TYPE, "application/json")],
                                 json!({
                                     "type": "error",
@@ -756,6 +867,12 @@ async fn anthropic_messages(
                     }
                 }
             }
+        }
+
+        // Same accounting as the OpenAI path: count what the caller was charged.
+        {
+            let (_, in_tokens, out_tokens, _) = extract_uds_content_text(&current_uds_resp);
+            state.usage.record(in_tokens, out_tokens);
         }
 
         if payload.stream == Some(true) {

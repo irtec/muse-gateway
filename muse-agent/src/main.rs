@@ -86,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         uds_client,
         media_client,
         supervisor: supervisor.clone(),
+        usage: std::sync::Arc::new(muse_agent::UsageStats::default()),
     };
 
     let app = create_agent_router(state);

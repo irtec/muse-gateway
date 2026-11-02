@@ -4,6 +4,80 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning is [SemVer](https://semver.org/).
 
+## [0.1.11] - 2026-11-02
+
+Failover is the hub's job, and quota is now a routing fact instead of a surprise.
+A client could previously receive a `422`, a `503`, or an empty body that it had
+to retry itself, and a node with no credits left kept receiving traffic.
+
+### Fixed
+
+**Hub — failover policy**
+
+- Retryable failures now fail over before the client sees anything: any `5xx`,
+  plus `408`, `422` and `429`. `422` in particular used to be terminal, so a
+  transient upstream failure ended the caller's turn.
+- The hub tries each worker once instead of retrying whichever node
+  round-robin happened to hand it. Retry budget raised from 3 to 5 attempts.
+- When every worker has failed, the reply is `503 upstream_unavailable` with a
+  message saying the hub already retried everything — not `502 bad_gateway`,
+  which read like the caller's request was at fault.
+- Only real faults (`5xx`, connection errors) take a node out of rotation. A
+  retryable `4xx` is retried elsewhere without marking the node unhealthy.
+
+**Hub — quota routing**
+
+- A worker that reports `insufficient_quota` is remembered as exhausted and
+  skipped by round-robin, so requests no longer waste a round trip on an account
+  with no credits. The node stays healthy: its services are fine.
+- The skip expires after 5 minutes so a refilled account rejoins on its own; a
+  `/health` probe that reports credits back clears it immediately.
+- Round-robin now rotates in worker definition order rather than `HashMap`
+  order, so rotation is stable and predictable.
+
+### Added
+
+- Per-node token accounting. The agent counts `usage` from every inference and
+  exposes it on `/health`; the sandbox publishes no credit balance, so this is
+  the real consumption signal available.
+- Telegram alerts carry the numbers: the fleet overview shows
+  `<tokens> tokens / <n> reqs` per node and flags `quota out`; the online alert
+  adds a `Token Usage` and `Quota` line.
+- Tests for the `422`/`503` failover paths, exhausted-node skipping, the
+  all-failed `503` reply, and usage formatting. 73 tests total.
+
+## [0.1.10] - 2026-11-02
+
+Tool calling no longer fails silently. A web-search client could ask for a tool,
+receive `HTTP 200` with an empty `content`, and stall — or receive `422` and treat
+the turn as permanently broken. Both came from the same place: the sandbox runs
+native function calls itself and returns the result in a channel the bridge never
+reads, so the gateway saw a successful response with nothing in it.
+
+### Fixed
+
+**Agent — tool calling**
+
+- Tool calls are forced into plain message text. A system-prompt directive
+  forbids the native function-calling API, so the model writes its call as JSON
+  in `content` where the gateway can see and parse it. Success on a tool-calling
+  prompt went from 0/3 to 6/6 against the live sandbox.
+- A response that carries neither a tool call nor text is retried twice, then
+  answered with `502` instead of an empty `200`. An empty `200` left the client
+  waiting on a response that had no content to render.
+- Transient sandbox failures (`ok:false`, e.g. "Web artifact inference failed.")
+  are retried twice, then mapped to `502` instead of `422`. `422` is terminal for
+  the client; `502` lets the hub fail over to another worker.
+- The Anthropic `/v1/messages` path gets the same treatment: retries before
+  giving up, and `502` in place of `422` for both the upstream-error and the
+  empty-content cases.
+
+### Added
+
+- Tests covering the empty-content retry, the `502` mapping for transient
+  upstream failures, and a plain-text tool call still parsing into
+  `tool_calls`. 65 tests total.
+
 ## [0.1.9] - 2026-11-02
 
 Recovery is the theme of this release. A replaced worker could come back with

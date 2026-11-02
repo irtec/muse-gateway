@@ -10,7 +10,7 @@ The infrastructure is built upon a **Centralized Hub-and-Spoke Gateway** topolog
 - **Edge Gateway (`YOUR_EDGE_IP`) — Central Hub (`muse-hub`):**
   - Ingests public traffic terminated by an SSL-enabled Nginx reverse proxy (`https://api.yourdomain.com`).
   - Dynamically manages the worker pool with round-robin load balancing.
-  - Transparent Zero-502 failover: if a worker encounters issues, the hub seamlessly retries across alternate healthy nodes up to 3 times.
+  - Transparent failover: a worker that fails is skipped and the request re-sent to an alternate node. Retryable statuses are any `5xx` plus `408`, `422` and `429`; each worker is tried once, up to 5 attempts, and a node without credits is skipped outright.
   - Performs active background health checks (every 5 seconds) and dispatches real-time state alerts to an operational Telegram group (`YOUR_TELEGRAM_CHAT_ID`).
   - Hosts the FRP Server (`frps` on port 7000) to accept incoming reverse TCP tunnels from sandbox VMs.
 - **Worker Sandbox VM (Hatch Platform) — Worker Node (`muse-agent`):**
@@ -29,6 +29,9 @@ The `muse-agent` stack on each worker node is an **All-in-One Native Rust** exec
 1. **Service 1: HTTP-to-UDS AI Bridge (`:11436`):**
    - Ingests standard OpenAI formats (`/v1/chat/completions`, SSE streaming, tool calling, multi-modal vision) and Anthropic specifications (`/v1/messages`).
    - Communicates directly over the binary UDS wire protocol (4-byte Big-Endian Length Prefix + JSON) to `/run/hatch/sandbox/space-inference.sock` and dedicated `/run/hatch/sandbox/space-media.sock` (`/v1/images/generations`).
+   - Steers tool calls into plain message text: the sandbox executes native function calls itself and returns the result in a channel the bridge never reads, so `content` arrives empty. A system-prompt directive forbids the native API and the call is parsed from `content` instead.
+   - Retries an empty or failed inference twice, then answers `502`. A transient sandbox failure is upstream, not the caller's fault, and `502` lets the hub fail over where a `422` would end the client's turn.
+   - Counts `usage` from every inference and exposes the running totals plus a sticky quota flag on `/health`, so the hub can report real consumption and route around a node with no credits left.
 2. **Service 2: Process Supervisor & Tunnel Manager:**
    - Supervises the child process `frpc` (reverse TCP tunnel to Edge Gateway port 7000). If the process terminates or crashes, the supervisor restarts it autonomously.
    - Adopts an `frpc` already started by `run.sh` instead of spawning a second one: a duplicate registers the same proxy names, is rejected with `session shutdown`, and would otherwise be respawned every cycle.
@@ -55,9 +58,9 @@ The `muse-agent` stack on each worker node is an **All-in-One Native Rust** exec
 
 ## External Cluster Features (Central Hub `muse-hub` on Edge Gateway)
 
-1. **Zero-502 Transparent Failover:** If a worker node goes offline, times out, or returns HTTP 5xx responses, `muse-hub` reroutes the request to alternate healthy workers up to 3 times without returning a 502 error to the client.
+1. **Transparent Failover:** If a worker node goes offline, times out, returns a `5xx`, or answers `408`/`422`/`429`, `muse-hub` reroutes the request to an alternate healthy worker. Each worker is tried once, up to 5 attempts. A node whose upstream account is out of credits is skipped by round-robin for 5 minutes instead of being retried on every request, and only real faults take a node out of rotation. If every node fails, the client receives `503 upstream_unavailable` naming that the hub already retried everything.
 2. **Zero-Root Resilience:** All agent processes (`muse-agent` and `frpc`) run completely in user-space without dependencies on root privileges.
-3. **Centralized Telegram Alerting:** Node and pool transitions are monitored centrally and alerted to the operational Telegram channel (`YOUR_TELEGRAM_CHAT_ID`). An outage is only announced after 3 consecutive failed probes, a recovery only after 3 consecutive clean probes, and repeat outage alerts for the same node are held back for 5 minutes so a flapping node cannot flood the channel. Exhausted upstream quota is **never** reported as an outage: the node keeps serving and stays healthy, and the hub fails requests over to a node that still has credits.
+3. **Centralized Telegram Alerting:** Node and pool transitions are monitored centrally and alerted to the operational Telegram channel (`YOUR_TELEGRAM_CHAT_ID`). An outage is only announced after 3 consecutive failed probes, a recovery only after 3 consecutive clean probes, and repeat outage alerts for the same node are held back for 5 minutes so a flapping node cannot flood the channel. Exhausted upstream quota is **never** reported as an outage: the node keeps serving and stays healthy, the hub routes around it, and the alert shows the node's token consumption and quota state. The sandbox publishes no credit balance, so the reported numbers are tokens served and requests handled — the real signals the platform exposes.
 
 ---
 

@@ -49,7 +49,7 @@ The project is structured into 3 core crates:
 
 ### 2. [`muse-hub`](./muse-hub/README.md)
 *Central gateway reverse proxy and worker pool manager (deployed on the Edge Gateway).*
-- **Transparent Zero-502 Failover:** Automatically retries active requests across healthy workers up to 3 times upon connection failure or 5xx responses.
+- **Transparent Failover:** Each worker is tried once per request (up to 5 attempts) on connection failure, any `5xx`, `408`, `422` or `429`. The caller only sees an error once every node has actually been tried.
 - **Dynamic Load Balancing:** Round-robin request distribution across all healthy worker nodes.
 - **Active Health Checking:** Periodic background health checks (every 5 seconds) across all registered workers.
 - **Telegram Ops Notifier:** Unified real-time alerting for node state transitions and pool health.

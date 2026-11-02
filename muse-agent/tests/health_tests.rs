@@ -27,6 +27,7 @@ async fn test_health_check_degraded_returns_503() {
         uds_client,
         media_client,
         supervisor,
+        usage: Arc::new(muse_agent::UsageStats::default()),
     };
 
     let app = create_agent_router(state);

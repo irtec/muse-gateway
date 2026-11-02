@@ -7,6 +7,12 @@ use crate::models::{
     UdsResponse,
 };
 
+/// The sandbox executes native function calls itself and returns the tool result
+/// in a channel we never receive: `result.content` comes back empty while
+/// `output_tokens` shows the model did generate. Forcing tool calls into plain
+/// message text keeps them observable and parseable (measured 9/10 vs 0/3).
+pub const TEXT_TOOL_CALL_DIRECTIVE: &str = "IMPORTANT: Never use the native function-calling API. Do not emit function_call or tool_calls objects. Always write your tool call as plain JSON text inside your normal message content.";
+
 pub fn extract_content_text(val: &Value) -> String {
     match val {
         Value::String(s) => {
@@ -631,6 +637,8 @@ pub fn convert_openai_to_uds(
         let mut tool_instructions = vec![
             "You have access to the following tools:".to_string(),
             tools_json,
+            String::new(),
+            crate::translator::TEXT_TOOL_CALL_DIRECTIVE.to_string(),
             "\nTool Calling Instructions:".to_string(),
             "- When you need to call a tool, respond with a JSON markdown code block in this format:"
                 .to_string(),
@@ -802,6 +810,8 @@ pub fn convert_anthropic_to_uds(req: &AnthropicRequest, default_slug: &str) -> U
         let mut tool_instructions = vec![
             "You have access to the following tools:".to_string(),
             tools_json,
+            String::new(),
+            crate::translator::TEXT_TOOL_CALL_DIRECTIVE.to_string(),
             "\nTool Calling Instructions:".to_string(),
             "- When you need to call a tool, respond with a JSON markdown code block in this format:"
                 .to_string(),
@@ -1363,4 +1373,49 @@ pub fn format_uds_to_anthropic_stream(
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tool_call_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parses_tool_call_wrapped_in_json_code_fence() {
+        let content =
+            "```json\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"motogp\"}}\n```";
+        let (is_tool, calls, clean) = parse_tool_calls(content);
+        assert!(is_tool);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "web_search");
+        assert!(calls[0].function.arguments.contains("motogp"));
+        assert!(clean.is_none() || clean.as_deref() == Some(""));
+    }
+
+    #[test]
+    fn parses_tool_call_with_braces_inside_string_arguments() {
+        // A query containing "}" used to break the balanced-brace scanner and the
+        // whole tool call was dropped, surfacing as an empty assistant message.
+        let content =
+            "{\"name\": \"web_search\", \"arguments\": {\"query\": \"docker {compose} tutorial\"}}";
+        let (is_tool, calls, _) = parse_tool_calls(content);
+        assert!(is_tool, "tool call with brace in string must still parse");
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].function.arguments.contains("docker"));
+    }
+
+    #[test]
+    fn parses_multiple_tool_calls_as_array() {
+        let content = "[{\"name\":\"web_search\",\"arguments\":{\"query\":\"a\"}},{\"name\":\"read_file\",\"arguments\":{\"path\":\"/x\"}}]";
+        let (is_tool, calls, _) = parse_tool_calls(content);
+        assert!(is_tool);
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn plain_text_is_not_a_tool_call() {
+        let (is_tool, calls, clean) = parse_tool_calls("Sure, here is a summary of the news.");
+        assert!(!is_tool);
+        assert!(calls.is_empty());
+        assert!(clean.is_some());
+    }
 }

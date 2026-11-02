@@ -89,7 +89,17 @@ pub struct WorkerStatus {
     pub role: Option<String>,
     pub last_update_error: Option<String>,
     pub reported_update_error: Option<String>,
+    pub usage: WorkerUsage,
+    /// When the node last reported quota exhaustion. A node is only skipped for
+    /// `quota_retry_after`; without an expiry an exhausted node would never get
+    /// traffic again and could never prove its credits came back.
+    pub quota_exhausted_since: Option<Instant>,
 }
+
+/// How long a quota-exhausted node is skipped before it gets traffic again.
+/// Long enough to stop burning round trips, short enough that a refilled
+/// account rejoins on its own.
+pub const QUOTA_RETRY_AFTER: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug)]
 pub struct PoolOptions {
@@ -124,6 +134,49 @@ pub struct WorkerSummary {
     /// Availability alerts held back by the cooldown; a high count means the
     /// node is flapping and its probe timeout or health path needs attention.
     pub suppressed_alerts: u32,
+    /// Tokens this node has served since it started, plus the last known quota
+    /// state. The sandbox exposes no credit balance, so this is the real signal.
+    pub usage: WorkerUsage,
+}
+
+/// Mirrors the agent's `/health` `usage` block.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerUsage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub requests: u64,
+    #[serde(default)]
+    pub quota_exhausted: bool,
+}
+
+impl WorkerUsage {
+    /// Compact human-readable form for alerts: `1.2M tokens / 340 reqs`.
+    pub fn summary(&self) -> String {
+        if self.requests == 0 {
+            return "no traffic yet".to_string();
+        }
+        format!(
+            "{} tokens / {} reqs",
+            format_tokens(self.total_tokens),
+            self.requests
+        )
+    }
+}
+
+/// Token counts get long fast; alerts read better in thousands and millions.
+pub fn format_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
 }
 
 pub struct WorkerPool {
@@ -223,7 +276,18 @@ pub fn format_fleet_overview(
                         }
                     })
                     .unwrap_or_else(|| "-".to_string());
-                lines.push(format!("• 🟢 {}: Healthy ({})", def.name, ver));
+                let quota_mark = if w.usage.quota_exhausted {
+                    " ⚠️ quota out"
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "• 🟢 {}: Healthy ({}) — {}{}",
+                    def.name,
+                    ver,
+                    w.usage.summary(),
+                    quota_mark
+                ));
             } else {
                 match &w.lifecycle {
                     LifecycleState::DownConfirmed { reason, .. }
@@ -327,6 +391,11 @@ pub fn format_online_alert(w: &WorkerStatus, fleet_overview: &str) -> String {
     };
     let checklist = format_subservice_checklist(&w.subservices);
     let time_str = Local::now().format("%Y-%m-%d %H:%M:%S");
+    let quota_line = if w.usage.quota_exhausted {
+        "⚠️ QUOTA EXHAUSTED (no credits left this period)"
+    } else {
+        "✅ Credits available"
+    };
 
     format!(
         "🟢 *[MUSE-HUB] Worker Fully Online & Healthy*\n\
@@ -339,10 +408,20 @@ pub fn format_online_alert(w: &WorkerStatus, fleet_overview: &str) -> String {
         *Subservices Status:*\n\
         {}\n\
         ━━━━━━━━━━━━━━━━━━━━━\n\
+        *Token Usage:* `{}`\n\
+        *Quota:* {}\n\
+        ━━━━━━━━━━━━━━━━━━━━━\n\
         {}\n\
         ━━━━━━━━━━━━━━━━━━━━━\n\
         *Time:* `{}`",
-        w.name, version_str, ssh_info, checklist, fleet_overview, time_str
+        w.name,
+        version_str,
+        ssh_info,
+        checklist,
+        w.usage.summary(),
+        quota_line,
+        fleet_overview,
+        time_str
     )
 }
 
@@ -530,6 +609,8 @@ impl WorkerPool {
                     role: None,
                     last_update_error: None,
                     reported_update_error: None,
+                    usage: WorkerUsage::default(),
+                    quota_exhausted_since: None,
                 },
             );
         }
@@ -549,18 +630,58 @@ impl WorkerPool {
         }
     }
 
-    /// Selects an active/healthy worker using Round-Robin for AI Inference
-    pub async fn select_worker(&self) -> Option<WorkerStatus> {
+    /// Selects a healthy worker for AI inference using Round-Robin.
+    ///
+    /// A node whose upstream account has no credits left is skipped: sending it
+    /// traffic only earns a `429` and a wasted round trip. If every healthy node
+    /// is out of credits, one is still returned so the caller can report the
+    /// real cause instead of pretending the pool is offline.
+    ///
+    /// `exclude` holds the workers already tried for this request. An
+    /// excluded-only pool falls back to the full healthy set: a repeat attempt
+    /// beats a hard failure when the alternative is nothing.
+    pub async fn select_worker_excluding(&self, exclude: &[String]) -> Option<WorkerStatus> {
         let workers = self.workers.read().await;
-        let healthy_workers: Vec<WorkerStatus> =
-            workers.values().filter(|w| w.is_healthy).cloned().collect();
 
-        if healthy_workers.is_empty() {
+        let healthy: Vec<WorkerStatus> =
+            workers.values().filter(|w| w.is_healthy).cloned().collect();
+        if healthy.is_empty() {
             return None;
         }
 
-        let idx = self.round_robin_counter.fetch_add(1, Ordering::Relaxed) % healthy_workers.len();
-        Some(healthy_workers[idx].clone())
+        let untried: Vec<WorkerStatus> = healthy
+            .iter()
+            .filter(|w| !exclude.iter().any(|u| u == &w.url))
+            .cloned()
+            .collect();
+        let candidates = if untried.is_empty() { healthy } else { untried };
+
+        // Prefer nodes that still have credits, in definition order so rotation
+        // is stable and predictable rather than HashMap-random. A node whose
+        // skip window has lapsed is retried: without that it could never prove
+        // its account was refilled.
+        let mut with_credits: Vec<WorkerStatus> = candidates
+            .iter()
+            .filter(|w| {
+                !w.usage.quota_exhausted
+                    || w.quota_exhausted_since
+                        .map(|since| since.elapsed() >= QUOTA_RETRY_AFTER)
+                        .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        if with_credits.is_empty() {
+            with_credits = candidates;
+        }
+        with_credits.sort_by_key(|w| {
+            self.definitions
+                .iter()
+                .position(|d| d.url == w.url)
+                .unwrap_or(usize::MAX)
+        });
+
+        let idx = self.round_robin_counter.fetch_add(1, Ordering::Relaxed) % with_credits.len();
+        Some(with_credits[idx].clone())
     }
 
     /// Selects candidate workers for File Server using Active-Standby priority:
@@ -600,6 +721,22 @@ impl WorkerPool {
         }
 
         candidates
+    }
+
+    /// Marks a worker's upstream account as out of credits. The node stays
+    /// healthy — its services are fine — but round-robin stops sending it
+    /// traffic until the retry window lapses or a probe clears the flag.
+    pub async fn mark_quota_exhausted(&self, target_url: &str) {
+        let mut workers = self.workers.write().await;
+        if let Some(w) = workers.get_mut(target_url) {
+            w.usage.quota_exhausted = true;
+            w.quota_exhausted_since = Some(Instant::now());
+            warn!(
+                "Worker {} reported quota exhausted; skipped for {}s unless it serves again",
+                w.name,
+                QUOTA_RETRY_AFTER.as_secs()
+            );
+        }
     }
 
     /// Marks a worker as failed immediately (e.g. connection refused / HTTP 502)
@@ -710,6 +847,21 @@ impl WorkerPool {
                                     .and_then(|v| v.as_str())
                                     .map(|s| s.trim().to_string())
                                     .filter(|s| !s.is_empty());
+
+                                // Older agents omit `usage`; keep the last value
+                                // rather than resetting the counters to zero.
+                                if let Some(usage_val) = parsed_val.get("usage") {
+                                    if let Ok(u) =
+                                        serde_json::from_value::<WorkerUsage>(usage_val.clone())
+                                    {
+                                        // A node that answers again has credits
+                                        // back: drop the skip so it rejoins.
+                                        if w.usage.quota_exhausted && !u.quota_exhausted {
+                                            w.quota_exhausted_since = None;
+                                        }
+                                        w.usage = u;
+                                    }
+                                }
 
                                 if let Some(r) = role {
                                     w.role = Some(r);
@@ -1092,6 +1244,7 @@ impl WorkerPool {
                 role: w.role.clone(),
                 last_update_error: w.last_update_error.clone(),
                 suppressed_alerts: w.suppressed_alerts,
+                usage: w.usage.clone(),
             })
             .collect()
     }

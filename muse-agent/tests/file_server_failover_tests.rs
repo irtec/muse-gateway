@@ -154,6 +154,7 @@ async fn test_health_reports_storage_down_for_placeholder_credentials() {
             muse_agent::config::SupervisorConfig::default(),
             "test-vm-placeholder".to_string(),
         )),
+        usage: Arc::new(muse_agent::UsageStats::default()),
     };
     let app = create_agent_router(state);
 

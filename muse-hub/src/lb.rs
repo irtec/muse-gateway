@@ -22,6 +22,19 @@ struct QuotaReply {
     body: Bytes,
 }
 
+/// Statuses that mean "this node could not serve the request" and are worth
+/// retrying on another node before the caller sees anything.
+///
+/// `408`/`425` are timeouts and retries, `429` is quota or throttling (handled
+/// separately when it carries the quota header), and `502`/`503`/`504` are the
+/// gateway/upstream failures the agent now emits for transient sandbox faults.
+fn is_failover_status(status: StatusCode) -> bool {
+    status.is_server_error()
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::UNPROCESSABLE_ENTITY
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<HubConfig>,
@@ -172,7 +185,8 @@ async fn health_check_handler(State(state): State<AppState>) -> impl IntoRespons
                 "last_update_error": w.last_update_error,
                 "last_checked_secs_ago": w.last_checked_secs_ago,
                 "active_requests": w.active_requests,
-                "suppressed_alerts": w.suppressed_alerts
+                "suppressed_alerts": w.suppressed_alerts,
+                "usage": w.usage
             })
         })
         .collect();
@@ -237,11 +251,15 @@ async fn forward_inference_handler(
 
     let path = uri.path();
     let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
-    let max_retries = 3;
+    // One attempt per worker, plus one spare in case the pool is smaller than
+    // the retry budget. Failover is the hub's job: a client must not be the one
+    // retrying because we gave up after three tries on the same bad node.
+    let max_retries = 5;
     let mut quota_reply: Option<QuotaReply> = None;
+    let mut tried: Vec<String> = Vec::new();
 
     for attempt in 1..=max_retries {
-        let worker = match state.pool.select_worker().await {
+        let worker = match state.pool.select_worker_excluding(&tried).await {
             Some(w) => w,
             None => {
                 warn!("No healthy Muse VM workers available in pool");
@@ -257,6 +275,7 @@ async fn forward_inference_handler(
                     .into_response();
             }
         };
+        tried.push(worker.url.clone());
 
         let target_url = format!("{}{}{}", worker.url.trim_end_matches('/'), path, query);
         info!(
@@ -289,7 +308,8 @@ async fn forward_inference_handler(
 
                 // Quota exhaustion is a billing state, not a fault. Fail over to a
                 // node that still has credits, but never mark this one unhealthy —
-                // its services are running fine.
+                // its services are running fine. Remember it so round-robin stops
+                // sending traffic here at all.
                 if status == StatusCode::TOO_MANY_REQUESTS {
                     let exhausted = resp
                         .headers()
@@ -302,6 +322,7 @@ async fn forward_inference_handler(
                             "Worker {} reported quota exhausted. Failing over; node stays healthy.",
                             worker.url
                         );
+                        state.pool.mark_quota_exhausted(&worker.url).await;
                         // Keep the first quota answer as the fallback reply, so the
                         // client still learns why nothing was generated.
                         if quota_reply.is_none() {
@@ -324,15 +345,23 @@ async fn forward_inference_handler(
                     }
                 }
 
-                if status.is_server_error() {
+                // Any other status that means "this node could not serve the
+                // request" is retried elsewhere before the client ever sees it.
+                // 4xx is normally the caller's fault, but these come from the
+                // upstream, not from a malformed request, so they fail over too.
+                if is_failover_status(status) {
                     warn!(
-                        "Worker {} returned HTTP {} server error. Triggering auto-failover...",
+                        "Worker {} returned HTTP {}. Triggering auto-failover...",
                         worker.url, status
                     );
-                    state
-                        .pool
-                        .mark_worker_failed(&worker.url, &format!("HTTP {}", status))
-                        .await;
+                    // Only a real fault takes the node out of rotation; a
+                    // retryable 4xx is the request's problem, not the node's.
+                    if status.is_server_error() {
+                        state
+                            .pool
+                            .mark_worker_failed(&worker.url, &format!("HTTP {}", status))
+                            .await;
+                    }
                     continue;
                 }
 
@@ -402,11 +431,12 @@ async fn forward_inference_handler(
     }
 
     (
-        StatusCode::BAD_GATEWAY,
+        StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
             "error": {
-                "message": "All retry attempts failed across live workers.",
-                "type": "bad_gateway"
+                "message": "Every worker failed to serve this request. The hub already retried all of them; retrying again will not help until a node recovers.",
+                "type": "upstream_unavailable",
+                "code": 503
             }
         })),
     )

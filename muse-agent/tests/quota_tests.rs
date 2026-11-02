@@ -80,6 +80,7 @@ async fn test_quota_response_passes_through_router() {
             config.supervisor.clone(),
             config.vm.id.clone(),
         )),
+        usage: Arc::new(muse_agent::UsageStats::default()),
     };
     let app = create_agent_router(state);
 

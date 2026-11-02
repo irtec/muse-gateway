@@ -8,6 +8,7 @@ pub mod supervisor;
 pub mod sync;
 pub mod translator;
 pub mod uds;
+pub mod usage;
 
 pub use config::AgentConfig;
 pub use egress::EgressConnector;
@@ -17,3 +18,4 @@ pub use server::{create_agent_router, AppState};
 pub use supervisor::ProcessSupervisor;
 pub use sync::{SyncClient, SyncConfig, SyncRole};
 pub use uds::UdsClient;
+pub use usage::{UsageSnapshot, UsageStats};
