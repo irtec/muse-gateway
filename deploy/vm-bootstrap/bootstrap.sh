@@ -51,6 +51,9 @@ rm -f /run/nologin /etc/nologin 2>/dev/null || true
 
 # Ensure log directory and file permissions are preserved on persistent storage
 mkdir -p "${LOG_DIR}" 2>/dev/null || true
+# File manager root_dir and sync root: a missing root serves 404 on every path.
+mkdir -p "${BASE_DIR}/../public" 2>/dev/null || true
+chmod 2775 "${BASE_DIR}/../public" 2>/dev/null || true
 chmod 755 "${BASE_DIR}/run.sh" 2>/dev/null || true
 
 # ==============================================================================
@@ -123,7 +126,18 @@ fi
 
 # Start the frpc reverse tunnel to Edge Gateway :7000, unless muse-agent's own
 # supervisor already owns it (it spawns and watches frpc itself).
-if ! pgrep -f "${BIN_DIR}/frpc" >/dev/null 2>&1; then
+#
+# Probe must ignore zombies: a defunct frpc keeps its name in the process table,
+# so `pgrep -f` reports "alive" and the tunnel is never restored. Only a live
+# (non-Z) process whose argv[0] is exactly the frpc binary counts.
+frpc_alive() {
+    ps -eo stat,args 2>/dev/null | awk -v bin="${BIN_DIR}/frpc" '
+        $1 !~ /^Z/ && $2 == bin { found = 1 }
+        END { exit(found ? 0 : 1) }
+    '
+}
+
+if ! frpc_alive; then
     if [ -f "${BIN_DIR}/frpc" ] && [ -f "${CONFIG_DIR}/frpc.toml" ]; then
         echo "[run.sh] Starting frpc tunnel to Edge Gateway..."
         nohup setsid "${BIN_DIR}/frpc" -c "${CONFIG_DIR}/frpc.toml" 200>&- >> "${LOG_DIR}/frpc.log" 2>&1 &

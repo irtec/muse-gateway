@@ -31,7 +31,10 @@ The `muse-agent` stack on each worker node is an **All-in-One Native Rust** exec
    - Communicates directly over the binary UDS wire protocol (4-byte Big-Endian Length Prefix + JSON) to `/run/hatch/sandbox/space-inference.sock` and dedicated `/run/hatch/sandbox/space-media.sock` (`/v1/images/generations`).
 2. **Service 2: Process Supervisor & Tunnel Manager:**
    - Supervises the child process `frpc` (reverse TCP tunnel to Edge Gateway port 7000). If the process terminates or crashes, the supervisor restarts it autonomously.
+   - Adopts an `frpc` already started by `run.sh` instead of spawning a second one: a duplicate registers the same proxy names, is rejected with `session shutdown`, and would otherwise be respawned every cycle.
+   - Reaps its own `frpc` child every cycle (`try_wait`), so a crash never leaves a defunct process behind, and applies exponential backoff (1s to 32s) on repeated spawn failures.
    - Enforces directory persistence for `logs/`, file permissions for `run.sh`, and storage mounts.
+   - Refreshes `run.sh` from the installer mirror when its hash differs, so recovery-runner fixes reach the fleet without reinstalling.
 3. **Service 3: SSH Daemon Supervisor & Self-Healing:**
    - Ensures OpenSSH server (`/usr/sbin/sshd` on port 22) remains active inside the container.
    - Idempotently verifies and writes the administrator's public `authorized_keys` to `/root/.ssh/` and `/home/hatch/.ssh/` (mode `0600`) during every check cycle, ensuring persistent access across container rebuilds.
@@ -43,9 +46,10 @@ The `muse-agent` stack on each worker node is an **All-in-One Native Rust** exec
    - Enforces strict sanity checks: file existence, minimum size threshold (>= 2 MB), and SHA-256 cryptographic hash comparison against the running binary.
    - If a new version is detected, copies it to a temporary sibling file (`agent/bin/muse-agent.update.<uuid>`), sets `0755` executable permissions, re-verifies the temp file's SHA-256 hash, and atomically replaces `agent/bin/muse-agent` using `std::fs::rename`.
    - Exits cleanly (`exit(0)`) after a brief log flush delay, allowing systemd or the platform supervisor watchdog (`run.sh`) to instantly restart the daemon with the new binary.
+   - Applies the same hash-compare and atomic-rename treatment to `run.sh` itself, sourcing `public/files/muse-agent-installer/bootstrap.sh`. Without it, a node keeps the recovery runner it was installed with forever, so fixes to its process probes never reach the fleet.
    - Combined with `muse-hub` active-standby routing, this provides zero-downtime rolling upgrades across all sandbox worker VMs.
 
-*(The **Axum File Manager Service (`:8080`)** is protected by PBKDF2-SHA256 authentication and deployed across all nodes, serving as Active Primary on Master VM-01 and Standby Failover on Replicas to power `files.yourdomain.com`).*
+*(The **Axum File Manager Service (`:8080`)** is protected by PBKDF2-SHA256 authentication and deployed across all nodes, serving as Active Primary on Master VM-01 and Standby Failover on Replicas to power `files.yourdomain.com`. `auth_salt` and `auth_hash` must be byte-identical on every worker, because failover logs the same user in against whichever node answers. A node still holding the placeholder credentials cannot accept any password, so it reports `storage: false` in `/health` and the hub will not route file traffic to it.)*
 
 ---
 
@@ -53,7 +57,7 @@ The `muse-agent` stack on each worker node is an **All-in-One Native Rust** exec
 
 1. **Zero-502 Transparent Failover:** If a worker node goes offline, times out, or returns HTTP 5xx responses, `muse-hub` reroutes the request to alternate healthy workers up to 3 times without returning a 502 error to the client.
 2. **Zero-Root Resilience:** All agent processes (`muse-agent` and `frpc`) run completely in user-space without dependencies on root privileges.
-3. **Centralized Telegram Alerting:** Node and pool transitions are monitored centrally and alerted to the operational Telegram channel (`YOUR_TELEGRAM_CHAT_ID`).
+3. **Centralized Telegram Alerting:** Node and pool transitions are monitored centrally and alerted to the operational Telegram channel (`YOUR_TELEGRAM_CHAT_ID`). An outage is only announced after 3 consecutive failed probes, a recovery only after 3 consecutive clean probes, and repeat outage alerts for the same node are held back for 5 minutes so a flapping node cannot flood the channel. Exhausted upstream quota is **never** reported as an outage: the node keeps serving and stays healthy, and the hub fails requests over to a node that still has credits.
 
 ---
 
@@ -99,6 +103,7 @@ workers = [
     { name = "VM-02 (Backup)", url = "http://127.0.0.1:18082", ssh_port = 2222, file_server_port = 18092 },
 ]
 health_check_interval_secs = 5
+health_check_timeout_secs = 10   # Per-probe timeout; must exceed worker /health latency
 request_timeout_secs = 120
 
 [telegram]
@@ -170,9 +175,9 @@ Compile and place the `muse-agent` and `frpc` binaries under `/home/hatch/worksp
    host = "127.0.0.1"
    port = 8080
    root_dir = "/home/hatch/workspace/public"
-   auth_user = "admin"
-   auth_salt = "00000000000000000000000000000000"
-   auth_hash = "0000000000000000000000000000000000000000000000000000000000000000"
+   auth_user = "YOUR_AUTH_USER"
+   auth_salt = "YOUR_AUTH_SALT"
+   auth_hash = "YOUR_AUTH_HASH"
 
    [sync]
    # In-Agent One-Way Sync Engine (Master VM-01)
@@ -240,9 +245,11 @@ Hatch platforms automatically rebuild container environments on a periodic basis
   "task_id": "vm-agent-watchdog",
   "recurring": true,
   "interval": "1m",
-  "command": "if ! pgrep -x muse-agent >/dev/null 2>&1 || ! pgrep -x frpc >/dev/null 2>&1 || ! curl -sf http://127.0.0.1:11436/health >/dev/null 2>&1; then /bin/bash /home/hatch/workspace/agent/run.sh; fi"
+  "command": "if ! pgrep -x muse-agent >/dev/null 2>&1 || ! ps -eo stat,args | awk '$1 !~ /^Z/ && $2 == \"/home/hatch/workspace/agent/bin/frpc\" {f=1} END {exit(f?0:1)}' || ! curl -sf http://127.0.0.1:11436/health >/dev/null 2>&1; then /bin/bash /home/hatch/workspace/agent/run.sh; fi"
 }
 ```
+
+`pgrep -x frpc` cannot be used here: a defunct (`Z`) frpc keeps its process name, so `pgrep` reports it as alive and the watchdog never runs recovery. Only a live process whose `argv[0]` is exactly the frpc binary counts, which is what the `ps`/`awk` probe above checks.
 
 Behavior:
 - Completes silently (`exit 0`) in under 0.1 seconds when all subservices are healthy.
@@ -266,10 +273,19 @@ Adding extra worker nodes enables zero-downtime failover and load balancing.
 ### Scale-Out Steps
 
 1. **Bootstrap Worker via Automated Script:**
-   On the new VM, execute the one-line installer:
+   On the new VM, execute the one-line installer (the variables go after the pipe; `VM_ID=vm2 curl ... | bash` would only export `VM_ID` to `curl`):
    ```bash
-   VM_ID=vm2 curl -fsSL -u admin:CHANGE_ME_PASSWORD https://files.yourdomain.com/files/muse-agent-installer/install.sh | bash
+   curl -fsSL -u admin:CHANGE_ME_PASSWORD https://files.yourdomain.com/files/muse-agent-installer/install.sh | \
+     VM_ID=vm2 \
+     CLUSTER_TOKEN="YOUR_CLUSTER_SECRET_TOKEN" \
+     EDGE_HOST="YOUR_EDGE_IP" \
+     FRP_TOKEN="YOUR_FRP_SECRET_TOKEN" \
+     FILE_SERVER_USER="YOUR_AUTH_USER" \
+     FILE_SERVER_SALT="YOUR_AUTH_SALT" \
+     FILE_SERVER_HASH="YOUR_AUTH_HASH" \
+     bash
    ```
+   `FILE_SERVER_SALT`/`FILE_SERVER_HASH` must be the same values used on every other worker, or a failover login returns `401` on the node that takes over.
 
 2. **Register Worker in Hub Configuration on Edge Gateway:**
    Update `/etc/muse-hub/config.toml` on the Edge Gateway:
@@ -307,6 +323,8 @@ The `muse-agent` daemon contains a built-in atomic self-updating engine that ena
 
 1. **Two-Stage Sync Detection:**
    - Replicas run `SyncClient` against the master's `/internal/sync/manifest` endpoint over the frp reverse tunnel (default 30s interval). The global `version_hash` short-circuits cycles with no filesystem changes.
+   - The digest is only recorded after every file in the delta landed intact. A failed download keeps the previous digest, so the next cycle retries instead of short-circuiting on a tree that never matched; failed staging files are deleted rather than accumulated.
+   - Loopback targets (`localhost`, `127.0.0.1`, `::1`) and any operator `NO_PROXY` entries bypass the egress proxy, so a master reached directly is never sent out through the sandbox.
    - Each agent's `ProcessSupervisor` then compares the synced installer binary against its own active binary every `check_interval_secs` (default 5s).
 2. **Zero-Downtime Rolling Restarts:**
    - Workers sync independently, so download completion and restart times are naturally desynchronized across the fleet.
@@ -340,6 +358,7 @@ Expected response:
   "service": "muse-hub",
   "status": "healthy",
   "total_workers": 1,
+  "alerts_emitted": 0,
   "workers": [
     {
       "active_requests": 0,
@@ -347,6 +366,7 @@ Expected response:
       "last_checked_secs_ago": 1,
       "name": "VM-01 (Prod)",
       "ssh_port": 2221,
+      "suppressed_alerts": 0,
       "url": "http://127.0.0.1:18081"
     }
   ]

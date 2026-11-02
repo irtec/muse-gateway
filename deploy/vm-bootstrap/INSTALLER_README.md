@@ -48,6 +48,18 @@ This document provides official operational instructions for deploying the **Nat
      - `[sync] auth_token`: Authenticates file sync pulling requests against Master VM-01.
    - Do not leave empty or modify with unmatched values. They represent a single shared cluster credential.
 
+3. **File Manager Credentials (Mandatory & Identical):**
+   - `FILE_SERVER_USER` / `FILE_SERVER_SALT` / `FILE_SERVER_HASH` protect `files.yourdomain.com`.
+   - Because the hub fails over between workers, the same login must work on **every** node. Generate one pair once, then reuse it on all workers:
+     ```bash
+     python3 -c 'import hashlib, secrets; p="YOUR_PASSWORD"; s=secrets.token_hex(16); h=hashlib.pbkdf2_hmac("sha256", p.encode(), bytes.fromhex(s), 200000, 32).hex(); print(f"FILE_SERVER_SALT={s}\nFILE_SERVER_HASH={h}")'
+     ```
+   - A node left on placeholder (all-zero) credentials cannot accept **any** password: PBKDF2 never produces an all-zero key, so every login is rejected with `401`. Such a node reports `storage: false` in `/health` and the hub refuses to fail over to it. The installer therefore aborts rather than writing placeholders.
+
+4. **Tunnel Credentials:**
+   - `EDGE_HOST`: public IP/hostname of the Edge Gateway (`frpc` `serverAddr`).
+   - `FRP_TOKEN`: must equal `auth.token` in the Edge Gateway's `frps.toml`.
+
 ---
 
 ## 3. Standard Installation Procedures (Worker Node SOP)
@@ -59,20 +71,35 @@ Choose either of the two installation methods below:
 Run the following one-line command to install (the script automatically calculates SSH `2220+N`, AI `18080+N`, and File Server `18090+N` ports based on `VM_ID`):
 
 ```bash
-VM_ID=vm2 curl -fsSL -u admin:CHANGE_ME_PASSWORD https://files.yourdomain.com/files/muse-agent-installer/install.sh | bash
+curl -fsSL -u admin:CHANGE_ME_PASSWORD https://files.yourdomain.com/files/muse-agent-installer/install.sh | \
+  VM_ID=vm2 \
+  CLUSTER_TOKEN="YOUR_CLUSTER_SECRET_TOKEN" \
+  EDGE_HOST="YOUR_EDGE_IP" \
+  FRP_TOKEN="YOUR_FRP_SECRET_TOKEN" \
+  FILE_SERVER_USER="YOUR_AUTH_USER" \
+  FILE_SERVER_SALT="YOUR_AUTH_SALT" \
+  FILE_SERVER_HASH="YOUR_AUTH_HASH" \
+  bash
 ```
 
-*Note: To manually designate port assignments, set corresponding environment variables:*
+The variables must be placed **after the pipe**. `VM_ID=vm2 curl ... | bash` exports `VM_ID` to `curl` only, so the installer would see an empty `VM_ID` and refuse to run.
+
+The installer refuses to write a config with placeholders. It aborts when `VM_ID`, `CLUSTER_TOKEN`, `FILE_SERVER_USER`, `FILE_SERVER_SALT` or `FILE_SERVER_HASH` is missing, and (when generating `frpc.toml`) when `EDGE_HOST` or `FRP_TOKEN` is missing. A node with placeholder file-manager credentials cannot accept any password and reports `storage: false`, so the hub would never fail over to it.
+
+*Note: To manually designate port assignments, add the same variables:*
 ```bash
-VM_ID=vm2 SSH_PORT=2222 AI_PORT=18082 FS_PORT=18092 \
-curl -fsSL -u admin:CHANGE_ME_PASSWORD https://files.yourdomain.com/files/muse-agent-installer/install.sh | bash
+curl -fsSL -u admin:CHANGE_ME_PASSWORD https://files.yourdomain.com/files/muse-agent-installer/install.sh | \
+  VM_ID=vm2 SSH_PORT=2222 AI_PORT=18082 FS_PORT=18092 \
+  CLUSTER_TOKEN="YOUR_CLUSTER_SECRET_TOKEN" EDGE_HOST="YOUR_EDGE_IP" FRP_TOKEN="YOUR_FRP_SECRET_TOKEN" \
+  FILE_SERVER_USER="YOUR_AUTH_USER" FILE_SERVER_SALT="YOUR_AUTH_SALT" FILE_SERVER_HASH="YOUR_AUTH_HASH" \
+  bash
 ```
 
 The script autonomously:
-1. Provisions directory structures under `/home/hatch/workspace/agent/`, downloads required binaries (`muse-agent`, `frpc`), fetches the self-healing runner (`run.sh`), and caches offline OpenSSH deb packages.
-2. Generates `muse-agent.toml` and `frpc.toml` populated with the identical cluster token and assigned VM port slots.
+1. Provisions directory structures under `/home/hatch/workspace/agent/` and `/home/hatch/workspace/public/`, downloads required binaries (`muse-agent`, `frpc`), fetches the self-healing runner (`run.sh`), and caches offline OpenSSH deb packages.
+2. Generates `muse-agent.toml` and `frpc.toml` with the shared cluster token, the shared file-manager credentials, and the assigned VM port slots. `role` is set to `master` when `VM_ID` ends in `1`, `replica` otherwise.
 3. Installs `/home/hatch/workspace/agent/systemd/muse-agent.service`, registers it with systemd, and enables it immediately (`enable --now`).
-4. Verifies local service health via `/health`.
+4. Verifies local service health via `/health` and exits non-zero unless `ok` is `true` (i.e. `storage` is ready too), so a broken node fails the install instead of joining the pool silently.
 
 ---
 
@@ -132,13 +159,14 @@ frpc_config = "/home/hatch/workspace/agent/config/frpc.toml"
 
 [file_manager]
 # Active-Standby File Server: Enabled so worker can serve as failover file server
+# auth_salt/auth_hash must be byte-identical on every worker; placeholders reject every login.
 enabled = true
 host = "127.0.0.1"
 port = 8080
 root_dir = "/home/hatch/workspace/public"
-auth_user = "admin"
-auth_salt = "00000000000000000000000000000000"
-auth_hash = "0000000000000000000000000000000000000000000000000000000000000000"
+auth_user = "YOUR_AUTH_USER"
+auth_salt = "YOUR_AUTH_SALT"
+auth_hash = "YOUR_AUTH_HASH"
 
 [sync]
 # In-Agent One-Way Sync Engine (Mirroring master VM-01 to ~/workspace/public)
@@ -248,8 +276,10 @@ Once the service is verified healthy via `curl http://127.0.0.1:11436/health`, r
 - **interval / recurring:** Every 1 minute (`* * * * *` or 1m)
 - **command:**
 ```bash
-if ! pgrep -x muse-agent >/dev/null 2>&1 || ! pgrep -x frpc >/dev/null 2>&1 || ! curl -sf http://127.0.0.1:11436/health >/dev/null 2>&1; then /bin/bash /home/hatch/workspace/agent/run.sh; fi
+if ! pgrep -x muse-agent >/dev/null 2>&1 || ! ps -eo stat,args | awk '$1 !~ /^Z/ && $2 == "/home/hatch/workspace/agent/bin/frpc" {f=1} END {exit(f?0:1)}' || ! curl -sf http://127.0.0.1:11436/health >/dev/null 2>&1; then /bin/bash /home/hatch/workspace/agent/run.sh; fi
 ```
+
+`pgrep -x frpc` must not be used for this check: a defunct (`Z`) frpc keeps its process name in the table, so `pgrep` reports it as alive and the watchdog never triggers recovery. Only a live process whose `argv[0]` is exactly the frpc binary counts.
 
 ---
 

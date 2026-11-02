@@ -47,10 +47,27 @@ fn ensure_key_in_file(path: &Path, key: &str, mode: u32) {
     }
 }
 
+/// True when `ps -eo stat,args` output contains a live process whose argv[0] is
+/// exactly `frpc_bin`. Zombies are skipped, and the `ps` invocation itself never
+/// matches because only argv[0] is compared (a shell probe would self-match).
+fn frpc_alive_in_ps(ps_output: &str, frpc_bin: &Path) -> bool {
+    let expected = frpc_bin.display().to_string();
+    ps_output.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let stat = fields.next().unwrap_or_default();
+        let argv0 = fields.next().unwrap_or_default();
+        !stat.starts_with('Z') && argv0 == expected
+    })
+}
+
 pub struct ProcessSupervisor {
     config: SupervisorConfig,
     vm_id: String,
     frpc_child: Arc<Mutex<Option<Child>>>,
+    /// Consecutive frpc restarts, reset once a spawn survives the backoff window.
+    frpc_fail_streak: Arc<Mutex<u32>>,
+    /// Time of the last frpc spawn attempt, used to gate the backoff.
+    frpc_last_spawn: Arc<Mutex<Option<Instant>>>,
     ssh_child: Arc<Mutex<Option<Child>>>,
     ssh_install_lock: Arc<Mutex<()>>,
     ssh_last_failure: Arc<Mutex<Option<Instant>>>,
@@ -63,6 +80,8 @@ impl ProcessSupervisor {
             config,
             vm_id,
             frpc_child: Arc::new(Mutex::new(None)),
+            frpc_fail_streak: Arc::new(Mutex::new(0)),
+            frpc_last_spawn: Arc::new(Mutex::new(None)),
             ssh_child: Arc::new(Mutex::new(None)),
             ssh_install_lock: Arc::new(Mutex::new(())),
             ssh_last_failure: Arc::new(Mutex::new(None)),
@@ -111,6 +130,7 @@ impl ProcessSupervisor {
         self.ensure_persistence().await;
         self.ensure_frpc_running().await;
         self.ensure_ssh_health().await;
+        self.ensure_run_sh_update().await;
         self.ensure_binary_update().await;
 
         let interval_duration = Duration::from_secs(self.config.check_interval_secs);
@@ -119,6 +139,7 @@ impl ProcessSupervisor {
             self.ensure_persistence().await;
             self.ensure_frpc_running().await;
             self.ensure_ssh_health().await;
+            self.ensure_run_sh_update().await;
             self.ensure_binary_update().await;
         }
     }
@@ -896,54 +917,73 @@ impl ProcessSupervisor {
 
         let mut child_lock = self.frpc_child.lock().await;
 
-        let needs_start = if let Some(child) = child_lock.as_mut() {
-            match child.try_wait() {
+        // Reap our own child first. `try_wait` also reaps the zombie, so a crashed
+        // frpc never lingers as a defunct process under the agent.
+        let child_state = match child_lock.as_mut() {
+            Some(child) => match child.try_wait() {
                 Ok(Some(status)) => {
                     warn!(
                         "frpc child process exited with status: {}. Restarting...",
                         status
                     );
-                    true
+                    Some(true)
                 }
-                Ok(None) => false, // Child is still running
+                Ok(None) => Some(false), // Child is still running
                 Err(e) => {
                     error!("Error checking frpc child process: {}. Restarting...", e);
-                    true
+                    Some(true)
                 }
-            }
-        } else {
-            // Detect an existing healthy frpc. Match on the binary PATH in argv (not
-            // the process name) so a zombie or an unrelated process cannot mask a
-            // live tunnel; `ensure_frpc_running` re-runs after every auto-update
-            // restart, and name-based matching made it spawn a duplicate each time.
-            let probe = format!(
-                "ps -eo stat,args 2>/dev/null | awk -v p='{bin}' '$1 !~ /^Z/ && index($0,p) > 0'",
-                bin = frpc_bin.display()
-            );
-            let is_alive = Command::new("sh")
-                .arg("-c")
-                .arg(&probe)
+            },
+            None => None,
+        };
+        if child_state == Some(true) {
+            *child_lock = None;
+        }
+
+        // An frpc started by run.sh (setsid, ppid=1) already owns the tunnels. A
+        // second frpc registers the same proxy names, is rejected with "session
+        // shutdown", exits 1, and would be respawned forever by this loop.
+        let external_frpc_alive = if child_lock.is_none() {
+            let output = Command::new("ps")
+                .args(["-eo", "stat,args"])
                 .output()
                 .await
-                .map(|o| o.status.success() && !o.stdout.is_empty())
-                .unwrap_or(false);
+                .ok()
+                .filter(|o| o.status.success());
+            output
+                .map(|o| frpc_alive_in_ps(&String::from_utf8_lossy(&o.stdout), &frpc_bin))
+                .unwrap_or(false)
+        } else {
+            false
+        };
 
-            if is_alive {
-                // An existing healthy frpc process is already running
+        let needs_start = match child_state {
+            Some(false) => {
+                *self.frpc_fail_streak.lock().await = 0;
                 false
-            } else {
-                // Clean up any dead/zombie frpc if present before spawning
-                let _ = Command::new("pkill")
-                    .arg("-9")
-                    .arg("-x")
-                    .arg("frpc")
-                    .output()
-                    .await;
-                true
             }
+            _ => !external_frpc_alive,
         };
 
         if needs_start {
+            // Exponential backoff on repeated failure, otherwise a config that can
+            // never connect produces a respawn every check interval (12/min).
+            let mut streak = self.frpc_fail_streak.lock().await;
+            let mut last_spawn = self.frpc_last_spawn.lock().await;
+            if let (Some(prev), n) = (*last_spawn, *streak) {
+                if n > 0 {
+                    let delay = Duration::from_secs(1u64 << n.min(5));
+                    if prev.elapsed() < delay {
+                        debug!("frpc restart backing off ({} consecutive failures)", n);
+                        return;
+                    }
+                }
+            }
+            *streak += 1;
+            *last_spawn = Some(Instant::now());
+            drop(streak);
+            drop(last_spawn);
+
             info!(
                 "Spawning supervised frpc process: {} -c {}",
                 frpc_bin.display(),
@@ -970,6 +1010,61 @@ impl ProcessSupervisor {
         }
     }
 
+    /// Refresh `run.sh` from the synced installer mirror.
+    ///
+    /// The binary self-updates through sync, but the recovery runner never did:
+    /// a node kept whatever `run.sh` it was installed with, so a fix to its
+    /// process probes could never reach the fleet. Hash-compare and atomic rename
+    /// so a half-written runner can never break recovery.
+    async fn ensure_run_sh_update(&self) {
+        let base_dir = PathBuf::from(&self.config.base_dir);
+        let active = base_dir.join("run.sh");
+        let parent_workspace = match base_dir.parent() {
+            Some(p) => p,
+            None => return,
+        };
+        let synced = parent_workspace
+            .join("public")
+            .join("files")
+            .join("muse-agent-installer")
+            .join("bootstrap.sh");
+
+        if !synced.exists() || !active.exists() {
+            return;
+        }
+
+        let (synced_hash, active_hash) = match (compute_sha256(&synced), compute_sha256(&active)) {
+            (Ok(s), Ok(a)) => (s, a),
+            _ => return,
+        };
+        if synced_hash == active_hash {
+            return;
+        }
+
+        let staged = base_dir.join(format!("run.sh.update.{}", uuid::Uuid::new_v4()));
+        if std::fs::copy(&synced, &staged).is_err() {
+            let _ = std::fs::remove_file(&staged);
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755));
+        }
+        if compute_sha256(&staged).ok().as_deref() != Some(synced_hash.as_str()) {
+            let _ = std::fs::remove_file(&staged);
+            return;
+        }
+        if std::fs::rename(&staged, &active).is_err() {
+            let _ = std::fs::remove_file(&staged);
+            return;
+        }
+        info!(
+            "Recovery runner updated from mirror (SHA256: {}). Next run.sh execution uses it.",
+            synced_hash
+        );
+    }
+
     /// Guarantee that essential directory structures and authorized keys exist.
     /// Internal process watchdog relies purely on the registered platform scheduler
     /// and does not spam non-functional file hooks (.profile, .bashrc, or json hooks).
@@ -987,5 +1082,46 @@ impl ProcessSupervisor {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&run_sh, std::fs::Permissions::from_mode(0o755));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::frpc_alive_in_ps;
+    use std::path::Path;
+
+    const FRPC: &str = "/home/hatch/workspace/agent/bin/frpc";
+
+    #[test]
+    fn live_frpc_is_detected() {
+        let ps = "Ss   /home/hatch/workspace/agent/bin/frpc -c /home/hatch/workspace/agent/config/frpc.toml\n";
+        assert!(frpc_alive_in_ps(ps, Path::new(FRPC)));
+    }
+
+    #[test]
+    fn zombie_frpc_is_not_alive() {
+        let ps = "Z    [frpc] <defunct>\nZ    /home/hatch/workspace/agent/bin/frpc -c /x\n";
+        assert!(!frpc_alive_in_ps(ps, Path::new(FRPC)));
+    }
+
+    #[test]
+    fn ps_probe_does_not_self_match() {
+        // A shell probe carrying the pattern in argv must never count as frpc.
+        let ps = "S+   sh -c pgrep -f /home/hatch/workspace/agent/bin/frpc\n\
+                  R    ps -eo stat,args\n\
+                  S    grep /home/hatch/workspace/agent/bin/frpc\n";
+        assert!(!frpc_alive_in_ps(ps, Path::new(FRPC)));
+    }
+
+    #[test]
+    fn unrelated_frpc_path_is_not_alive() {
+        let ps = "S    /usr/local/bin/frpc -c /etc/frpc.toml\nS    /tmp/frpc -c /x\n";
+        assert!(!frpc_alive_in_ps(ps, Path::new(FRPC)));
+    }
+
+    #[test]
+    fn empty_ps_output_is_not_alive() {
+        assert!(!frpc_alive_in_ps("", Path::new(FRPC)));
+        assert!(!frpc_alive_in_ps("STAT COMMAND\n", Path::new(FRPC)));
     }
 }
